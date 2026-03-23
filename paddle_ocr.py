@@ -200,8 +200,19 @@ def fix_internal_residual_rows(md):
         fixed_rows = [rows[0]]  # 表头行直接保留
         for idx in range(1, len(rows)):
             cells = RE_CELL_GROUPED.findall(rows[idx])
-            # 第一列为空 → 残余行，追加到上一行
-            if cells and not cell_text(cells[0][1]) and len(fixed_rows) > 1:
+            cell_texts = [cell_text(c[1]) for c in cells]
+            non_empty_count = sum(1 for t in cell_texts if t)
+            total = len(cell_texts)
+
+            # 残余行判断：第一列为空 且 大部分单元格为空（>50%）
+            # 区别于 rowspan 行：rowspan 行第一列也为空，但大部分单元格有值
+            is_residual = (
+                total > 0
+                and not cell_texts[0]                    # 第一列为空
+                and non_empty_count <= total * 0.5        # 超过一半为空
+            )
+
+            if is_residual and len(fixed_rows) > 1:
                 fixed_rows[-1] = merge_residual_row(fixed_rows[-1], rows[idx])
             else:
                 fixed_rows.append(rows[idx])
@@ -280,14 +291,22 @@ def merge_cross_page_tables(md, header_threshold=0.9):
             i -= 1
             continue
 
-        # ── 条件2（必要条件）：第二个表格第一行数据的第一列为空 ──
+        # ── 条件2（必要条件）：第二个表格第一行数据是残余行 ──
+        #   - 第一列为空
+        #   - 大部分单元格为空（>50%），区别于 rowspan 造成的正常空首列
         body2 = rows2[1:]  # 去掉表头
         if not body2:
             i -= 1
             continue
         first_data_cells = RE_CELL_GROUPED.findall(body2[0])
-        if not first_data_cells or cell_text(first_data_cells[0][1]):
-            # 第一列有内容 → 不是残余行 → 是正常的新表格，不合并
+        first_cell_texts = [cell_text(c[1]) for c in first_data_cells]
+        non_empty = sum(1 for t in first_cell_texts if t)
+        is_residual = (
+            first_data_cells
+            and not first_cell_texts[0]                         # 第一列为空
+            and non_empty <= len(first_cell_texts) * 0.5        # 超过一半为空
+        )
+        if not is_residual:
             i -= 1
             continue
 
@@ -360,13 +379,13 @@ def parse_pdf_to_markdown(file_path, output_dir='./output'):
     results = pipeline.predict(
         input=file_path,
         use_queues=False,                     # 必须 False，否则容易内存异常
-        temperature=0.0,                       # greedy decoding，最确定性输出，减少幻觉
-        top_p=0.1,                             # 双保险，防止 temperature 意外非零时兜底
-        max_pixels=1003520,                    # 官方默认值(1280*28*28)，超出训练范围反而降低精度
-        markdown_ignore_labels=[              # 忽略这些版面元素（不输出到 markdown）
-            'footnote', 'header_image', 'footer', 'footer_image', 'aside_text',
-        ],
-        layout_unclip_ratio=1.5,              # 扩大检测框，减少边缘内容被裁掉
+        # temperature=0.0,                       # greedy decoding，最确定性输出，减少幻觉
+        # top_p=0.1,                             # 双保险，防止 temperature 意外非零时兜底
+        # max_pixels=1003520,                    # 官方默认值(1280*28*28)，超出训练范围反而降低精度
+        # markdown_ignore_labels=[              # 忽略这些版面元素（不输出到 markdown）
+        #     'footnote', 'header_image', 'footer', 'footer_image', 'aside_text',
+        # ],
+        # layout_unclip_ratio=1.5,              # 扩大检测框，减少边缘内容被裁掉
     )
 
     # 收集各页 markdown 并拼接
