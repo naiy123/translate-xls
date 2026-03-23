@@ -182,6 +182,36 @@ def merge_residual_row(last_row, residual_row):
     return ''.join(merged)
 
 
+def fix_internal_residual_rows(md):
+    """
+    修复单个表格内部的残余行。
+
+    当 restructure_pages 或百度 API 的 merge_tables 已经把跨页表格合并为一个 <table> 时，
+    残余行会出现在表格内部（而非两个独立表格之间）。
+    本函数扫描每个表格，将第一列为空的行追加到上一行。
+    """
+    def fix_table(match):
+        table_html = match.group()
+        table_tag = RE_TABLE_OPEN.match(table_html).group()
+        rows = RE_ROW.findall(table_html)
+        if len(rows) < 3:
+            return table_html
+
+        fixed_rows = [rows[0]]  # 表头行直接保留
+        for idx in range(1, len(rows)):
+            cells = RE_CELL_GROUPED.findall(rows[idx])
+            # 第一列为空 → 残余行，追加到上一行
+            if cells and not cell_text(cells[0][1]) and len(fixed_rows) > 1:
+                fixed_rows[-1] = merge_residual_row(fixed_rows[-1], rows[idx])
+            else:
+                fixed_rows.append(rows[idx])
+
+        all_rows = ''.join(f'<tr>{r}</tr>' for r in fixed_rows)
+        return f'{table_tag}{all_rows}</table>'
+
+    return RE_TABLE.sub(fix_table, md)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 跨页表格合并（核心后处理逻辑）
 #
@@ -330,19 +360,20 @@ def parse_pdf_to_markdown(file_path, output_dir='./output'):
     results = pipeline.predict(
         input=file_path,
         use_queues=False,                     # 必须 False，否则容易内存异常
-        max_pixels=2048 * 2048,               # 增大图像分辨率，提升小字识别率
+        max_pixels=1003520,                    # 官方默认值(1280*28*28)，超出训练范围反而降低精度
         markdown_ignore_labels=[              # 忽略这些版面元素（不输出到 markdown）
             'footnote', 'header_image', 'footer', 'footer_image', 'aside_text',
         ],
-        layout_unclip_ratio=1.5,              # 扩大检测框，减少边缘内容被裁掉
+        layout_unclip_ratio=(1.0, 2.0),       # 水平不扩，垂直扩2倍，抓住跨页底部边缘字
     )
 
     # 收集各页 markdown 并拼接
     markdown_list = [res.markdown for res in results]
     md = pipeline.concatenate_markdown_pages(markdown_list)
 
-    # 跨页表格合并（核心后处理）
+    # 后处理：跨页表格合并 → 表内残余行修复
     md = merge_cross_page_tables(md)
+    md = fix_internal_residual_rows(md)
 
     # 写入文件
     stem = Path(file_path).stem
