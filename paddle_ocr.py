@@ -204,10 +204,12 @@ def fix_internal_residual_rows(md):
             non_empty_count = sum(1 for t in cell_texts if t)
             total = len(cell_texts)
 
-            # 残余行判断：第一列为空 且 大部分单元格为空（>50%）
-            # 区别于 rowspan 行：rowspan 行第一列也为空，但大部分单元格有值
+            # 残余行判断（区别于 rowspan 造成的正常空首列）：
+            #   - 第一列为空
+            #   - 列数 ≥ 5（3-4列表格的 rowspan 行无法区分，不做合并）
+            #   - 非空单元格占比 < 50%
             is_residual = (
-                total > 0
+                total >= 5
                 and not cell_texts[0]                    # 第一列为空
                 and non_empty_count <= total * 0.5        # 超过一半为空
             )
@@ -301,10 +303,12 @@ def merge_cross_page_tables(md, header_threshold=0.9):
         first_data_cells = RE_CELL_GROUPED.findall(body2[0])
         first_cell_texts = [cell_text(c[1]) for c in first_data_cells]
         non_empty = sum(1 for t in first_cell_texts if t)
+        total_cols = len(first_cell_texts)
         is_residual = (
             first_data_cells
+            and total_cols >= 5                                  # 3-4列表格不做（无法区分 rowspan）
             and not first_cell_texts[0]                         # 第一列为空
-            and non_empty <= len(first_cell_texts) * 0.5        # 超过一半为空
+            and non_empty <= total_cols * 0.5                   # 超过一半为空
         )
         if not is_residual:
             i -= 1
