@@ -366,7 +366,7 @@ def parse_pdf_to_markdown(file_path, output_dir='./output'):
         markdown_ignore_labels=[              # 忽略这些版面元素（不输出到 markdown）
             'footnote', 'header_image', 'footer', 'footer_image', 'aside_text',
         ],
-        layout_unclip_ratio=(1.0, 2.0),       # 水平不扩，垂直扩2倍，抓住跨页底部边缘字
+        layout_unclip_ratio=1.5,              # 扩大检测框，减少边缘内容被裁掉
     )
 
     # 收集各页 markdown 并拼接
