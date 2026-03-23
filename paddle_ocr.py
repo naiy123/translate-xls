@@ -360,6 +360,8 @@ def parse_pdf_to_markdown(file_path, output_dir='./output'):
     results = pipeline.predict(
         input=file_path,
         use_queues=False,                     # 必须 False，否则容易内存异常
+        temperature=0.0,                       # greedy decoding，最确定性输出，减少幻觉
+        top_p=0.1,                             # 双保险，防止 temperature 意外非零时兜底
         max_pixels=1003520,                    # 官方默认值(1280*28*28)，超出训练范围反而降低精度
         markdown_ignore_labels=[              # 忽略这些版面元素（不输出到 markdown）
             'footnote', 'header_image', 'footer', 'footer_image', 'aside_text',
