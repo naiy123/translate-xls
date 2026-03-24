@@ -60,6 +60,10 @@ NOISE_LABELS = frozenset({
     'aside_text',
 })
 
+# 低置信度阈值：低于此值的非噪音标签也视为噪音（版面检测误分类）
+# 例如页眉被误检为 figure_title，但置信度只有 0.5
+NOISE_SCORE_THRESHOLD = 0.65
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 配置加载 & 日志初始化
@@ -116,36 +120,56 @@ logger = setup_logger()
 
 def build_table_adjacency(results):
     """
-    从 VLM 结果的 block_label 判断哪些相邻表格之间只有噪音。
+    从 VLM 结果的 block_label + 检测置信度判断哪些相邻表格之间只有噪音。
 
-    遍历所有页面的所有 block，找到所有 table block 的位置，
-    检查每对相邻 table 之间的 block 是否全部是噪音标签。
+    判断逻辑：
+      - NOISE_LABELS 中的标签 → 噪音
+      - 不在 NOISE_LABELS 中但置信度 < NOISE_SCORE_THRESHOLD → 也当噪音（误检）
+        例如页眉被误分类为 figure_title 但置信度只有 0.5
+      - 不在 NOISE_LABELS 中且置信度 ≥ NOISE_SCORE_THRESHOLD → 正文，阻止合并
 
     参数：
       results: list of predict() 返回的 res 对象
 
     返回：
       set of int，包含可以与下一个 table 合并的 table 序号。
-      如 {0, 2} 表示第0个 table 可以和第1个合并，第2个可以和第3个合并。
     """
-    # 收集所有 block 的 label
-    all_labels = []
+    # 收集所有 block 的 (label, score)
+    all_blocks = []
     for res in results:
         data = res.json
         res_data = data.get('res', data)
+        # parsing_res_list 有 label 但没有 score，score 在 layout_det_res 里
+        # 按 block_id 对应
+        # parsing_res_list 和 layout_det_res.boxes 按 block_id 对应
+        boxes = res_data.get('layout_det_res', {}).get('boxes', [])
         for block in res_data.get('parsing_res_list', []):
-            all_labels.append(block.get('block_label', ''))
+            label = block.get('block_label', '')
+            # 尝试从 layout_det_res 取 score，按 block_id 匹配
+            score = 1.0  # 默认高置信度（安全侧：默认不当噪音）
+            block_id = block.get('block_id')
+            if block_id is not None and block_id < len(boxes):
+                score = boxes[block_id].get('score', 1.0)
+            all_blocks.append((label, score))
 
     # 找到所有 table block 的位置
-    table_positions = [i for i, label in enumerate(all_labels) if label == 'table']
+    table_positions = [i for i, (label, _) in enumerate(all_blocks) if label == 'table']
 
     # 检查每对相邻 table 之间是否只有噪音
+    def is_noise(label, score):
+        if label in NOISE_LABELS:
+            return True
+        # 非噪音标签但置信度低于阈值 → 视为误检
+        if score < NOISE_SCORE_THRESHOLD:
+            return True
+        return False
+
     mergeable = set()
     for k in range(len(table_positions) - 1):
         idx1, idx2 = table_positions[k], table_positions[k + 1]
-        between = all_labels[idx1 + 1 : idx2]
-        if all(label in NOISE_LABELS for label in between):
-            mergeable.add(k)  # 第 k 个 table 可以和第 k+1 个 table 合并
+        between = all_blocks[idx1 + 1 : idx2]
+        if all(is_noise(label, score) for label, score in between):
+            mergeable.add(k)
 
     return mergeable
 
