@@ -339,9 +339,8 @@ def parse_pdf_to_markdown(file_path, output_dir='./output'):
         use_queues=False,
         temperature=0.0,
         top_p=0.1,
-        max_pixels=1003520,
-        markdown_ignore_labels=['footnote', 'header_image', 'footer', 'footer_image', 'aside_text'],
-        layout_unclip_ratio=1.5,
+        # 注意：不传 markdown_ignore_labels，让页眉页脚等正常输出到 md
+        # 合并逻辑基于 block_label 判断噪音，不依赖 md 中是否有这些内容
     ))
 
     # 从 block_label 判断哪些相邻表格之间只有噪音（最可靠，不依赖正则）
