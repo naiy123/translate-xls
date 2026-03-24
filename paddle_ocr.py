@@ -7,13 +7,14 @@ PDF 转 Markdown 工具 —— 基于 PaddleOCR-VL + 跨页表格合并
   1. 读取 config15.ini 配置（GPU设备、vLLM服务地址等）
   2. 调用 PaddleOCR-VL 逐页识别 PDF（版面检测 + VLM 内容识别）
   3. 将各页 markdown 拼接为完整文档
-  4. 后处理：检测并合并因分页断裂的 HTML 表格
+  4. 后处理：基于 block_label 检测并合并因分页断裂的 HTML 表格
   5. 输出最终 .md 文件
 
 关于跨页表格合并：
   PDF 分页时，一个表格可能被切成两半，VLM 会分别识别为两个独立的 <table>。
   第二个 <table> 的第一行通常是残余行（上一页最后一行的后半部分），特征是第一列为空。
-  本脚本通过比较相邻表格的表头来判断是否属于同一个表，并将残余行追加到上一个表格的末尾行。
+  本脚本通过 VLM 返回的 block_label（而非正则猜测）判断两表之间是否只有页间噪音，
+  再结合表头匹配和残余行检测来决定是否合并。
 
 依赖：
   - paddleocr（需要安装对应 conda 环境）
@@ -39,21 +40,25 @@ import configparser
 # ══════════════════════════════════════════════════════════════════════════════
 # 预编译正则表达式
 # 所有 HTML 解析用的正则统一在此定义，避免运行时重复编译。
-# 处理几百页 PDF 时，这些正则会被调用上千次，预编译能显著提升性能。
 # ══════════════════════════════════════════════════════════════════════════════
 
-RE_TABLE = re.compile(r'<table\b[^>]*>.*?</table>', re.DOTALL)        # 匹配完整的 <table>...</table>
-RE_ROW = re.compile(r'<tr[^>]*>(.*?)</tr>', re.DOTALL)                # 匹配 <tr> 行，捕获内部内容
-RE_CELL = re.compile(r'<td[^>]*>.*?</td>', re.DOTALL)                # 匹配完整的 <td>（含标签）
-RE_CELL_GROUPED = re.compile(r'(<td[^>]*>)(.*?)(</td>)', re.DOTALL)  # 分组捕获：(开标签)(内容)(闭标签)
-RE_HTML_TAG = re.compile(r'<[^>]+>')                                  # 匹配任意 HTML 标签（用于去标签）
-RE_TABLE_OPEN = re.compile(r'<table\b[^>]*>')                        # 匹配 <table> 开标签（保留属性用）
+RE_TABLE = re.compile(r'<table\b[^>]*>.*?</table>', re.DOTALL)
+RE_ROW = re.compile(r'<tr[^>]*>(.*?)</tr>', re.DOTALL)
+RE_CELL = re.compile(r'<td[^>]*>.*?</td>', re.DOTALL)
+RE_CELL_GROUPED = re.compile(r'(<td[^>]*>)(.*?)(</td>)', re.DOTALL)
+RE_HTML_TAG = re.compile(r'<[^>]+>')
+RE_TABLE_OPEN = re.compile(r'<table\b[^>]*>')
 
-# 页间噪音模式：页码、报告编号、版本号、页眉页脚等固定文本
-# 这些内容出现在两个表格之间时，不影响"同一个表"的判断
-RE_PAGE_NOISE = re.compile(
-    r'^(第\s*\d+\s*页|共\s*\d+\s*页|【.*版】|正文|附录)$|报告编号',
-)
+# 噪音标签：这些 block_label 出现在两个表格之间时，不影响"同一个表"的判断
+# 来自 PP-DocLayoutV3 的 23 种检测类别，以下是页间噪音类
+NOISE_LABELS = frozenset({
+    'header', 'header_image',
+    'footer', 'footer_image',
+    'number',       # 页码（PP-DocLayoutV3 实际输出的标签名）
+    'page_number',  # 兼容可能的其他标签名
+    'footnote',
+    'aside_text',
+})
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -68,10 +73,6 @@ def load_config(path='config15.ini'):
       [paddleocr_vl]
       device = 2
       vl_rec_server_url = http://127.0.0.1:8118/v1
-
-    其中：
-      - device: 指定版面检测模型使用的 GPU 编号
-      - vl_rec_server_url: vLLM 推理服务的地址（VLM 内容识别通过 HTTP 调用此服务）
     """
     config = configparser.ConfigParser()
     if not config.read(path, encoding='utf-8'):
@@ -80,10 +81,7 @@ def load_config(path='config15.ini'):
 
 
 def setup_logger():
-    """
-    初始化日志系统：文件日志（按天轮转）+ 控制台输出。
-    日志文件保存在 ./logs/task.log，每6天轮转一次，保留7份。
-    """
+    """初始化日志：文件（按天轮转）+ 控制台。"""
     fmt = logging.Formatter(
         "%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
@@ -99,81 +97,87 @@ def setup_logger():
     logger.setLevel(logging.INFO)
     logger.addHandler(fh)
     logger.addHandler(logging.StreamHandler())
-
-    # pdfminer 的日志太多了，只保留错误级别
     logging.getLogger("pdfminer").setLevel(logging.ERROR)
     return logger
 
 
-# 模块加载时执行：读配置、设 GPU、初始化日志
 config = load_config()
-os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"  # 跳过模型源连通性检查，内网环境必须
+os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
 os.environ['CUDA_VISIBLE_DEVICES'] = config['paddleocr_vl']['device']
 logger = setup_logger()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# HTML 表格辅助函数
+# block_label 噪音判断
 #
-# PaddleOCR-VL 输出的 markdown 中，表格是 HTML 格式（<table><tr><td>...），
-# 以下函数用于解析和操作这些 HTML 表格。
+# 每个 block 都有 VLM 分配的 block_label（如 header、table、paragraph_title 等），
+# 这是最可靠的判断依据——不需要正则猜测内容类型。
+# ══════════════════════════════════════════════════════════════════════════════
+
+def build_table_adjacency(results):
+    """
+    从 VLM 结果的 block_label 判断哪些相邻表格之间只有噪音。
+
+    遍历所有页面的所有 block，找到所有 table block 的位置，
+    检查每对相邻 table 之间的 block 是否全部是噪音标签。
+
+    参数：
+      results: list of predict() 返回的 res 对象
+
+    返回：
+      set of int，包含可以与下一个 table 合并的 table 序号。
+      如 {0, 2} 表示第0个 table 可以和第1个合并，第2个可以和第3个合并。
+    """
+    # 收集所有 block 的 label
+    all_labels = []
+    for res in results:
+        data = res.json
+        res_data = data.get('res', data)
+        for block in res_data.get('parsing_res_list', []):
+            all_labels.append(block.get('block_label', ''))
+
+    # 找到所有 table block 的位置
+    table_positions = [i for i, label in enumerate(all_labels) if label == 'table']
+
+    # 检查每对相邻 table 之间是否只有噪音
+    mergeable = set()
+    for k in range(len(table_positions) - 1):
+        idx1, idx2 = table_positions[k], table_positions[k + 1]
+        between = all_labels[idx1 + 1 : idx2]
+        if all(label in NOISE_LABELS for label in between):
+            mergeable.add(k)  # 第 k 个 table 可以和第 k+1 个 table 合并
+
+    return mergeable
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HTML 表格辅助函数
 # ══════════════════════════════════════════════════════════════════════════════
 
 def cell_text(html):
-    """
-    去掉 HTML 标签，返回纯文本。
-    例如：'<td style="...">终端安全</td>' → '终端安全'
-    """
+    """去掉 HTML 标签，返回纯文本。"""
     return RE_HTML_TAG.sub('', html).strip()
 
 
 def row_cells_text(row_html):
-    """
-    从一个 <tr> 行中提取所有单元格的纯文本列表。
-    例如：'<td>序号</td><td>设备名称</td>' → ['序号', '设备名称']
-    用于表头比较。
-    """
+    """从 <tr> 行中提取所有单元格的纯文本列表，用于表头比较。"""
     return [cell_text(c) for c in RE_CELL.findall(row_html)]
-
-
-def is_page_noise_only(text):
-    """
-    判断两个表格之间的文本是否只包含页间噪音。
-
-    页间噪音包括：页码（"第21页 共1292页"）、报告编号、版本号（"【2025版】"）、
-    页眉页脚文字（"正文"、"附录"）等。
-
-    如果两个表格之间只有这些噪音，说明它们原本是同一个表格被分页切断了。
-    如果中间有标题（如"2.3.2.3 安全设备"）或正文内容，说明是不同的表格。
-    """
-    clean = RE_HTML_TAG.sub('', text).strip()
-    return all(
-        not line or RE_PAGE_NOISE.search(line)
-        for line in (l.strip() for l in clean.split('\n'))
-    )
 
 
 def merge_residual_row(last_row, residual_row):
     """
-    将残余行的内容逐列追加到上一行。
-
-    跨页断裂时，上一页最后一行可能不完整（如"终端安全"、"病毒防"），
-    下一页第一行是残余内容（如"管理"、"aServer-R-2305"）。
-    本函数将残余内容按列追加到对应的单元格中。
-
-    注意：严格逐列操作，绝不跨列。保留原始 <td> 的 style 属性。
+    将残余行的内容逐列追加到上一行。严格逐列，保留 <td> 样式。
 
     示例：
-      上一行: | 4 | 终端安全 | 否 | 3.7.12R3 | 深信服         | 病毒防 | 重要 |
-      残余行: |   | 管理     |   |          | aServer-R-2305 |       |      |
-      结果:   | 4 | 终端安全管理 | 否 | 3.7.12R3 | 深信服aServer-R-2305 | 病毒防 | 重要 |
+      上一行: | 4 | 终端安全 | 否 | 深信服         | 病毒防 | 重要 |
+      残余行: |   | 管理     |   | aServer-R-2305 |       |      |
+      结果:   | 4 | 终端安全管理 | 否 | 深信服aServer-R-2305 | 病毒防 | 重要 |
     """
     last_cells = RE_CELL_GROUPED.findall(last_row)
     res_cells = RE_CELL_GROUPED.findall(residual_row)
 
     merged = []
     for j in range(max(len(last_cells), len(res_cells))):
-        # 保留上一行的 <td> 开标签（含 style 等属性）
         tag_open = last_cells[j][0] if j < len(last_cells) else '<td>'
         c1 = cell_text(last_cells[j][1]) if j < len(last_cells) else ''
         c2 = cell_text(res_cells[j][1]) if j < len(res_cells) else ''
@@ -182,13 +186,104 @@ def merge_residual_row(last_row, residual_row):
     return ''.join(merged)
 
 
+def is_residual_row(row_html):
+    """
+    判断一行是否是跨页残余行。
+
+    残余行特征（区别于 rowspan 造成的正常空首列）：
+      - 第一列为空
+      - 列数 ≥ 5（3-4列表格的 rowspan 行无法区分，不做合并）
+      - 非空单元格占比 ≤ 50%
+    """
+    cells = RE_CELL_GROUPED.findall(row_html)
+    cell_texts = [cell_text(c[1]) for c in cells]
+    total = len(cell_texts)
+    if total < 5:
+        return False
+    non_empty = sum(1 for t in cell_texts if t)
+    return not cell_texts[0] and non_empty <= total * 0.5
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 跨页表格合并
+#
+# 合并条件（AND，全部满足才合并）：
+#   1. 表头 ≥90% 匹配
+#   2. 第二个表格第一行数据是残余行（第一列空 + 大部分空 + 列数≥5）
+#   3. 两表之间只有噪音标签的 block（由 build_table_adjacency 预计算）
+# ══════════════════════════════════════════════════════════════════════════════
+
+def merge_cross_page_tables(md, mergeable_set, header_threshold=0.9):
+    """
+    合并跨页断裂的 HTML 表格。
+
+    参数：
+      md: 完整的 markdown 文本
+      mergeable_set: build_table_adjacency 返回的可合并 table 序号集合
+      header_threshold: 表头匹配阈值，默认 0.9
+    """
+    tables = list(RE_TABLE.finditer(md))
+    if len(tables) < 2:
+        return md
+
+    i = len(tables) - 2
+    while i >= 0:
+        # 条件3：block_label 级别的噪音判断（最可靠）
+        if i not in mergeable_set:
+            i -= 1
+            continue
+
+        t1, t2 = tables[i], tables[i + 1]
+        rows1 = RE_ROW.findall(t1.group())
+        rows2 = RE_ROW.findall(t2.group())
+
+        if not rows1 or len(rows2) < 2:
+            i -= 1
+            continue
+
+        # 条件1：表头匹配
+        h1, h2 = row_cells_text(rows1[0]), row_cells_text(rows2[0])
+        if len(h1) != len(h2) or not h1:
+            i -= 1
+            continue
+        match_ratio = sum(a == b for a, b in zip(h1, h2)) / len(h1)
+        if match_ratio < header_threshold:
+            i -= 1
+            continue
+
+        # 条件2：第二个表格第一行数据是残余行
+        body2 = rows2[1:]
+        if not body2 or not is_residual_row(body2[0]):
+            i -= 1
+            continue
+
+        # ── 三个条件全部满足，执行合并 ──
+        logger.info(f"合并跨页表格: 表头匹配率={match_ratio:.0%}, "
+                     f"表1共{len(rows1)}行, 表2共{len(rows2)}行")
+
+        rows1[-1] = merge_residual_row(rows1[-1], body2[0])
+        body2 = body2[1:]
+
+        all_rows = ''.join(f'<tr>{r}</tr>' for r in rows1 + body2)
+        table_tag = RE_TABLE_OPEN.match(t1.group()).group()
+        md = md[:t1.start()] + f'{table_tag}{all_rows}</table>' + md[t2.end():]
+
+        # 重新扫描 + 更新 mergeable_set（合并后序号偏移）
+        tables = list(RE_TABLE.finditer(md))
+        # 合并了第 i 和 i+1 个表格，后续序号全部 -1
+        mergeable_set = {(k - 1 if k > i else k) for k in mergeable_set if k != i}
+        i = min(i, len(tables) - 2)
+        continue
+
+    return md
+
+
 def fix_internal_residual_rows(md):
     """
     修复单个表格内部的残余行。
 
-    当 restructure_pages 或百度 API 的 merge_tables 已经把跨页表格合并为一个 <table> 时，
-    残余行会出现在表格内部（而非两个独立表格之间）。
-    本函数扫描每个表格，将第一列为空的行追加到上一行。
+    当 restructure_pages 或 merge_cross_page_tables 已经合并了跨页表格，
+    但残余行仍在表格内部时，本函数扫描每个表格并将残余行追加到上一行。
     """
     def fix_table(match):
         table_html = match.group()
@@ -197,24 +292,9 @@ def fix_internal_residual_rows(md):
         if len(rows) < 3:
             return table_html
 
-        fixed_rows = [rows[0]]  # 表头行直接保留
+        fixed_rows = [rows[0]]
         for idx in range(1, len(rows)):
-            cells = RE_CELL_GROUPED.findall(rows[idx])
-            cell_texts = [cell_text(c[1]) for c in cells]
-            non_empty_count = sum(1 for t in cell_texts if t)
-            total = len(cell_texts)
-
-            # 残余行判断（区别于 rowspan 造成的正常空首列）：
-            #   - 第一列为空
-            #   - 列数 ≥ 5（3-4列表格的 rowspan 行无法区分，不做合并）
-            #   - 非空单元格占比 < 50%
-            is_residual = (
-                total >= 5
-                and not cell_texts[0]                    # 第一列为空
-                and non_empty_count <= total * 0.5        # 超过一半为空
-            )
-
-            if is_residual and len(fixed_rows) > 1:
+            if is_residual_row(rows[idx]) and len(fixed_rows) > 1:
                 fixed_rows[-1] = merge_residual_row(fixed_rows[-1], rows[idx])
             else:
                 fixed_rows.append(rows[idx])
@@ -226,130 +306,11 @@ def fix_internal_residual_rows(md):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 跨页表格合并（核心后处理逻辑）
-#
-# 这是整个脚本最关键的函数。PaddleOCR-VL 逐页识别 PDF，当一个表格跨越两页时，
-# 会被识别为两个独立的 <table>。本函数检测并合并这种情况。
-# ══════════════════════════════════════════════════════════════════════════════
-
-def merge_cross_page_tables(md, header_threshold=0.9):
-    """
-    合并跨页断裂的 HTML 表格。
-
-    必须同时满足以下三个条件才会合并（AND 关系，任一不满足则跳过）：
-
-      条件1 - 表头匹配：两个表格的表头列数相同，且 ≥90% 的列名一致。
-              90% 是为了兜底 OCR 偶尔识别错表头的情况（如"序号"→"席号"）。
-              7列表头允许1列不匹配。
-
-      条件2 - 残余行（必要条件）：第二个表格去掉表头后，第一行数据的第一列（序号列）为空。
-              这是跨页断裂最明确的信号 —— 正常表格的序号列不会为空。
-              如果第一列有内容，说明这是一个正常的新表格，绝不合并。
-
-      条件3 - 页间噪音：两个表格之间只有页眉页脚等噪音，没有标题或正文内容。
-              如果中间有"2.3.2.3 安全设备"这样的标题，说明是不同的表。
-
-    合并过程：
-      1. 去掉第二个表格的重复表头行
-      2. 将残余行逐列追加到第一个表格的最后一行
-      3. 将第二个表格的剩余数据行拼接到第一个表格末尾
-      4. 删除两表之间的页间噪音内容
-
-    参数：
-      md: 完整的 markdown 文本
-      header_threshold: 表头匹配阈值，默认 0.9（90%）
-
-    返回：
-      处理后的 markdown 文本
-    """
-    tables = list(RE_TABLE.finditer(md))
-    if len(tables) < 2:
-        return md
-
-    # 从后往前遍历，因为合并会改变字符串长度，从后往前可以避免前面的偏移被影响
-    i = len(tables) - 2
-    while i >= 0:
-        t1, t2 = tables[i], tables[i + 1]
-        rows1 = RE_ROW.findall(t1.group())
-        rows2 = RE_ROW.findall(t2.group())
-
-        # 基本校验：两个表都要有行，第二个表至少要有表头+1行数据
-        if not rows1 or len(rows2) < 2:
-            i -= 1
-            continue
-
-        # ── 条件1：表头匹配 ≥ threshold ──
-        h1, h2 = row_cells_text(rows1[0]), row_cells_text(rows2[0])
-        if len(h1) != len(h2) or not h1:
-            i -= 1
-            continue
-        match_ratio = sum(a == b for a, b in zip(h1, h2)) / len(h1)
-        if match_ratio < header_threshold:
-            i -= 1
-            continue
-
-        # ── 条件3：两表之间只有页间噪音 ──
-        if not is_page_noise_only(md[t1.end():t2.start()]):
-            i -= 1
-            continue
-
-        # ── 条件2（必要条件）：第二个表格第一行数据是残余行 ──
-        #   - 第一列为空
-        #   - 大部分单元格为空（>50%），区别于 rowspan 造成的正常空首列
-        body2 = rows2[1:]  # 去掉表头
-        if not body2:
-            i -= 1
-            continue
-        first_data_cells = RE_CELL_GROUPED.findall(body2[0])
-        first_cell_texts = [cell_text(c[1]) for c in first_data_cells]
-        non_empty = sum(1 for t in first_cell_texts if t)
-        total_cols = len(first_cell_texts)
-        is_residual = (
-            first_data_cells
-            and total_cols >= 5                                  # 3-4列表格不做（无法区分 rowspan）
-            and not first_cell_texts[0]                         # 第一列为空
-            and non_empty <= total_cols * 0.5                   # 超过一半为空
-        )
-        if not is_residual:
-            i -= 1
-            continue
-
-        # ── 三个条件全部满足，执行合并 ──
-        logger.info(f"合并跨页表格: 表头匹配率={match_ratio:.0%}, 表1共{len(rows1)}行, 表2共{len(rows2)}行")
-
-        # 步骤1：残余行追加到上一个表格的末尾行
-        rows1[-1] = merge_residual_row(rows1[-1], body2[0])
-        body2 = body2[1:]  # 残余行已处理，从 body 中移除
-
-        # 步骤2：拼接 —— 第一个表格的所有行 + 第二个表格的剩余数据行
-        all_rows = ''.join(f'<tr>{r}</tr>' for r in rows1 + body2)
-
-        # 步骤3：保留第一个表格的 <table> 开标签（含 border、style 等属性）
-        table_tag = RE_TABLE_OPEN.match(t1.group()).group()
-        merged_table = f'{table_tag}{all_rows}</table>'
-
-        # 步骤4：替换原文 —— 从第一个表格开始到第二个表格结束（含中间噪音）全部替换
-        md = md[:t1.start()] + merged_table + md[t2.end():]
-
-        # 字符串变了，重新扫描所有表格位置
-        tables = list(RE_TABLE.finditer(md))
-        i = min(i, len(tables) - 2)
-        continue
-
-    return md
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 # OCR Pipeline
 # ══════════════════════════════════════════════════════════════════════════════
 
 def create_pipeline():
-    """
-    创建 PaddleOCR-VL pipeline。
-
-    连接远程 vLLM 推理服务。版面检测模型（PP-DocLayoutV3）会自动加载到本地 GPU。
-    VLM 内容识别通过 HTTP 调用 vLLM 服务完成。
-    """
+    """创建 PaddleOCR-VL pipeline，连接远程 vLLM 推理服务。"""
     return PaddleOCRVL(
         vl_rec_backend="vllm-server",
         vl_rec_server_url=config['paddleocr_vl']['vl_rec_server_url'],
@@ -361,43 +322,38 @@ def parse_pdf_to_markdown(file_path, output_dir='./output'):
     PDF → Markdown 主流程。
 
     步骤：
-      1. 创建 pipeline（版面检测 + VLM）
-      2. 逐页识别 PDF，每页返回一个 markdown 结果
-      3. 拼接所有页的 markdown
-      4. 跨页表格合并（后处理）
-      5. 写入 .md 文件
-
-    参数：
-      file_path: 输入 PDF 文件路径
-      output_dir: 输出目录，默认 ./output
-
-    返回：
-      输出的 .md 文件路径
+      1. VLM 逐页识别
+      2. 从 block_label 预计算可合并的表格对
+      3. 拼接 markdown
+      4. 跨页表格合并（基于 block_label + 表头匹配 + 残余行检测）
+      5. 表内残余行修复
+      6. 写入 .md 文件
     """
     logger.info(f"开始处理: {file_path}")
     os.makedirs(output_dir, exist_ok=True)
 
     pipeline = create_pipeline()
 
-    # 逐页识别
-    results = pipeline.predict(
+    results = list(pipeline.predict(
         input=file_path,
-        use_queues=False,                     # 必须 False，否则容易内存异常
-        # temperature=0.0,                       # greedy decoding，最确定性输出，减少幻觉
-        # top_p=0.1,                             # 双保险，防止 temperature 意外非零时兜底
-        # max_pixels=1003520,                    # 官方默认值(1280*28*28)，超出训练范围反而降低精度
-        # markdown_ignore_labels=[              # 忽略这些版面元素（不输出到 markdown）
-        #     'footnote', 'header_image', 'footer', 'footer_image', 'aside_text',
-        # ],
-        # layout_unclip_ratio=1.5,              # 扩大检测框，减少边缘内容被裁掉
-    )
+        use_queues=False,
+        temperature=0.0,
+        top_p=0.1,
+        max_pixels=1003520,
+        markdown_ignore_labels=['footnote', 'header_image', 'footer', 'footer_image', 'aside_text'],
+        layout_unclip_ratio=1.5,
+    ))
 
-    # 收集各页 markdown 并拼接
+    # 从 block_label 判断哪些相邻表格之间只有噪音（最可靠，不依赖正则）
+    mergeable = build_table_adjacency(results)
+    logger.info(f"共 {len(mergeable)} 对相邻表格可能需要合并")
+
+    # 拼接 markdown
     markdown_list = [res.markdown for res in results]
     md = pipeline.concatenate_markdown_pages(markdown_list)
 
-    # 后处理：跨页表格合并 → 表内残余行修复
-    md = merge_cross_page_tables(md)
+    # 后处理
+    md = merge_cross_page_tables(md, mergeable)
     md = fix_internal_residual_rows(md)
 
     # 写入文件
