@@ -210,22 +210,32 @@ def merge_residual_row(last_row, residual_row):
     return ''.join(merged)
 
 
-def is_residual_row(row_html):
+def is_residual_row(row_html, header_col_count=None):
     """
     判断一行是否是跨页残余行。
 
-    残余行特征（区别于 rowspan 造成的正常空首列）：
+    残余行 vs rowspan 行的区分：
+      - 残余行：<td> 数量 = 表头列数（每列都有 td，只是内容为空）
+      - rowspan 行：<td> 数量 < 表头列数（被 rowspan 覆盖的列没有 td 标签）
+
+    所以：如果当前行的 td 数量 < 表头列数，说明是 rowspan 行，不是残余行。
+
+    额外条件：
       - 第一列为空
-      - 列数 ≥ 5（3-4列表格的 rowspan 行无法区分，不做合并）
       - 非空单元格占比 ≤ 50%
     """
     cells = RE_CELL_GROUPED.findall(row_html)
     cell_texts = [cell_text(c[1]) for c in cells]
     total = len(cell_texts)
-    if total < 5:
+    if total == 0 or cell_texts[0]:
         return False
+
+    # rowspan 行的 td 数量 < 表头列数（被合并的列没有 td）
+    if header_col_count and total < header_col_count:
+        return False
+
     non_empty = sum(1 for t in cell_texts if t)
-    return not cell_texts[0] and non_empty <= total * 0.5
+    return non_empty <= total * 0.5
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -277,7 +287,7 @@ def merge_cross_page_tables(md, mergeable_set, header_threshold=0.9):
 
         # 条件2：第二个表格第一行数据是残余行
         body2 = rows2[1:]
-        if not body2 or not is_residual_row(body2[0]):
+        if not body2 or not is_residual_row(body2[0], header_col_count=len(h1)):
             i -= 1
             continue
 
@@ -316,9 +326,12 @@ def fix_internal_residual_rows(md):
         if len(rows) < 3:
             return table_html
 
+        # 表头列数，用于区分残余行和 rowspan 行
+        header_col_count = len(RE_CELL.findall(rows[0]))
+
         fixed_rows = [rows[0]]
         for idx in range(1, len(rows)):
-            if is_residual_row(rows[idx]) and len(fixed_rows) > 1:
+            if is_residual_row(rows[idx], header_col_count) and len(fixed_rows) > 1:
                 fixed_rows[-1] = merge_residual_row(fixed_rows[-1], rows[idx])
             else:
                 fixed_rows.append(rows[idx])
