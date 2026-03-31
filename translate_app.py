@@ -510,6 +510,8 @@ selected_langs = st.multiselect(
 
 # 开始翻译
 if st.button("开始翻译", type="primary", disabled=not uploaded_file or not selected_langs or st.session_state.translating):
+    if not uploaded_file or not selected_langs:
+        st.stop()
     if not api_key:
         st.error("请在侧边栏输入 OpenAI API Key，或在服务器设置环境变量。")
         st.stop()
