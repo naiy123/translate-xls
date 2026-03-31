@@ -8,6 +8,7 @@ import os
 import re
 import tempfile
 import zipfile
+import subprocess
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from collections import defaultdict
@@ -72,6 +73,28 @@ def read_xlsx(file_path):
                 cells[(cell.row - 1, cell.column - 1)] = str(cell.value).strip()
     wb.close()
     return cells, ws.max_row, ws.max_column, ws.title
+
+
+def convert_xls_to_xlsx_libreoffice(xls_path):
+    """用 LibreOffice 将 .xls 转为 .xlsx，保留图片和格式"""
+    out_dir = str(Path(xls_path).parent)
+    result = subprocess.run(
+        ["libreoffice", "--headless", "--convert-to", "xlsx", xls_path, "--outdir", out_dir],
+        capture_output=True, text=True, timeout=60,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"LibreOffice 转换失败: {result.stderr}")
+    xlsx_path = str(Path(xls_path).with_suffix('.xlsx'))
+    if not Path(xlsx_path).exists():
+        raise RuntimeError("LibreOffice 转换后未找到 .xlsx 文件")
+    return xlsx_path
+
+
+def ensure_xlsx(file_path):
+    """确保输入是 xlsx 格式。xls 自动用 LibreOffice 转换（保留图片）"""
+    if Path(file_path).suffix.lower() != '.xls':
+        return file_path
+    return convert_xls_to_xlsx_libreoffice(file_path)
 
 
 def read_file(file_path):
@@ -502,6 +525,16 @@ if st.button("开始翻译", type="primary", disabled=not uploaded_file or not s
 
     ext = Path(uploaded_file.name).suffix.lower()
     stem = Path(uploaded_file.name).stem
+
+    # xls 自动转 xlsx（保留图片）
+    if ext == '.xls':
+        try:
+            st.info("检测到 .xls 格式，正在转换为 .xlsx（保留图片）...")
+            input_path = ensure_xlsx(input_path)
+        except Exception as e:
+            st.error(f".xls 转换失败: {e}。请手动用 WPS/Excel 另存为 .xlsx 后再上传。")
+            st.session_state.translating = False
+            st.stop()
 
     # 读取文件
     try:
