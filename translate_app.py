@@ -445,7 +445,8 @@ def _save_xlsx_with_images(original_path, translations, output_path):
             if alignment is None:
                 alignment = ET.SubElement(xf, f'{{{NS}}}alignment')
             alignment.set('wrapText', '1')
-            alignment.set('shrinkToFit', '1')
+            if alignment.get('shrinkToFit'):
+                del alignment.attrib['shrinkToFit']
             xf.set('applyAlignment', '1')
 
     new_shared = ET.tostring(ss_root, encoding='unicode', xml_declaration=True)
