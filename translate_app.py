@@ -450,6 +450,13 @@ st.set_page_config(page_title="表格翻译工具", page_icon="🌐", layout="ce
 st.title("📊 XLS/XLSX 表格翻译工具")
 st.caption("上传 Excel 文件，自动翻译为英语 / 泰语 / 缅甸语")
 
+# 初始化 session_state
+if "result_zip" not in st.session_state:
+    st.session_state.result_zip = None
+    st.session_state.result_filename = None
+    st.session_state.result_cost = None
+    st.session_state.translating = False
+
 # API Key 配置（从环境变量或侧边栏输入）
 api_key = os.getenv("OPENAI_API") or os.getenv("OPENAI_API_KEY") or ""
 with st.sidebar:
@@ -463,8 +470,10 @@ with st.sidebar:
     if api_key_input:
         api_key = api_key_input
 
-# 上传文件
+# 上传文件（上传新文件时清除旧结果）
 uploaded_file = st.file_uploader("上传 Excel 文件", type=["xlsx", "xls"])
+if uploaded_file is None:
+    st.session_state.result_zip = None
 
 # 选择语言
 lang_options = {"en": "English (英语)", "th": "Thai (泰语)", "my": "Burmese (缅甸语)"}
@@ -476,11 +485,13 @@ selected_langs = st.multiselect(
 )
 
 # 开始翻译
-if st.button("开始翻译", type="primary", disabled=not uploaded_file or not selected_langs):
+if st.button("开始翻译", type="primary", disabled=not uploaded_file or not selected_langs or st.session_state.translating):
     if not api_key:
         st.error("请在侧边栏输入 OpenAI API Key，或在服务器设置环境变量。")
         st.stop()
 
+    st.session_state.translating = True
+    st.session_state.result_zip = None
     client = OpenAI(api_key=api_key)
 
     # 保存上传文件到临时目录
@@ -497,6 +508,7 @@ if st.button("开始翻译", type="primary", disabled=not uploaded_file or not s
         cells, nrows, ncols, sheet_name = read_file(input_path)
     except Exception as e:
         st.error(f"读取文件失败: {e}")
+        st.session_state.translating = False
         st.stop()
 
     translatable = {k: v for k, v in cells.items() if is_translatable(v)}
@@ -574,26 +586,46 @@ if st.button("开始翻译", type="primary", disabled=not uploaded_file or not s
         except Exception as e:
             st.error(f"保存 {lang_name} 结果失败: {e}")
 
-    # 费用统计
-    st.divider()
-    model = DEFAULT_MODEL
-    pricing = PRICING.get(model, {"input": 0, "output": 0})
-    input_cost = total_tokens["input"] / 1_000_000 * pricing["input"]
-    output_cost = total_tokens["output"] / 1_000_000 * pricing["output"]
-    total_cost = input_cost + output_cost
-    st.metric("本次费用", f"${total_cost:.4f}",
-              help=f"Input: {total_tokens['input']:,} tokens, Output: {total_tokens['output']:,} tokens")
-
-    # 下载按钮
+    # 打包所有结果为 zip
     if result_files:
-        st.divider()
-        st.subheader("下载翻译结果")
-        cols = st.columns(len(result_files))
-        for i, (lang, (filename, data)) in enumerate(result_files.items()):
-            with cols[i]:
-                st.download_button(
-                    label=f"📥 {LANGUAGES[lang]}",
-                    data=data,
-                    file_name=filename,
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
+        import io
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for lang, (filename, data) in result_files.items():
+                zf.writestr(filename, data)
+        zip_buffer.seek(0)
+
+        st.session_state.result_zip = zip_buffer.getvalue()
+        st.session_state.result_filename = f"{stem}_translated.zip"
+
+        # 费用统计
+        model = DEFAULT_MODEL
+        pricing = PRICING.get(model, {"input": 0, "output": 0})
+        input_cost = total_tokens["input"] / 1_000_000 * pricing["input"]
+        output_cost = total_tokens["output"] / 1_000_000 * pricing["output"]
+        total_cost = input_cost + output_cost
+        st.session_state.result_cost = {
+            "total": total_cost,
+            "input_tokens": total_tokens["input"],
+            "output_tokens": total_tokens["output"],
+        }
+
+    st.session_state.translating = False
+    st.rerun()
+
+# 显示结果（持久化，不会因为点击下载而消失）
+if st.session_state.result_zip:
+    st.divider()
+    st.success("翻译完成！")
+
+    if st.session_state.result_cost:
+        cost = st.session_state.result_cost
+        st.metric("本次费用", f"${cost['total']:.4f}",
+                  help=f"Input: {cost['input_tokens']:,} tokens, Output: {cost['output_tokens']:,} tokens")
+
+    st.download_button(
+        label="📥 下载全部翻译结果 (zip)",
+        data=st.session_state.result_zip,
+        file_name=st.session_state.result_filename,
+        mime="application/zip",
+    )
