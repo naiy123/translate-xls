@@ -2,3 +2,6 @@ streamlit
 openpyxl
 xlrd
 openai
+pymupdf
+requests
+pillow

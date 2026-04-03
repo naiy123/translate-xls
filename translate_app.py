@@ -492,9 +492,9 @@ def _save_xlsx_with_images(original_path, translations, output_path):
 # Streamlit 界面
 # ══════════════════════════════════════════════════════════════════════════════
 
-st.set_page_config(page_title="表格翻译工具", page_icon="🌐", layout="centered")
-st.title("📊 XLS/XLSX 表格翻译工具")
-st.caption("上传 Excel 文件，自动翻译为英语 / 泰语 / 缅甸语")
+st.set_page_config(page_title="图纸/表格翻译工具", page_icon="🌐", layout="centered")
+st.title("📊 图纸 & 表格翻译工具")
+st.caption("上传 Excel 表格或工程图纸 PDF，自动脱敏翻译")
 
 # 初始化 session_state
 if "result_zip" not in st.session_state:
@@ -502,9 +502,15 @@ if "result_zip" not in st.session_state:
     st.session_state.result_filename = None
     st.session_state.result_cost = None
     st.session_state.translating = False
+if "pdf_result" not in st.session_state:
+    st.session_state.pdf_result = None
+    st.session_state.pdf_filename = None
+    st.session_state.pdf_processing = False
 
 # API Key 配置（从环境变量或侧边栏输入）
 api_key = os.getenv("OPENAI_API") or os.getenv("OPENAI_API_KEY") or ""
+baidu_api_key = os.getenv("BAIDU_API_KEY") or ""
+baidu_secret_key = os.getenv("BAIDU_SECRET_KEY") or ""
 with st.sidebar:
     st.header("设置")
     api_key_input = st.text_input(
@@ -516,107 +522,119 @@ with st.sidebar:
     if api_key_input:
         api_key = api_key_input
 
-# 上传文件（上传新文件时清除旧结果）
-uploaded_file = st.file_uploader("上传 Excel 文件", type=["xlsx", "xls"])
-if uploaded_file is None:
-    st.session_state.result_zip = None
+    st.divider()
+    st.subheader("百度 OCR（图纸用）")
+    baidu_key_input = st.text_input(
+        "BAIDU_API_KEY",
+        value=baidu_api_key,
+        type="password",
+    )
+    baidu_secret_input = st.text_input(
+        "BAIDU_SECRET_KEY",
+        value=baidu_secret_key,
+        type="password",
+    )
+    if baidu_key_input:
+        baidu_api_key = baidu_key_input
+    if baidu_secret_input:
+        baidu_secret_key = baidu_secret_input
 
-# 选择语言
-lang_options = {"en": "English (英语)", "th": "Thai (泰语)", "my": "Burmese (缅甸语)"}
-selected_langs = st.multiselect(
-    "目标语言",
-    options=list(lang_options.keys()),
-    default=["en", "th", "my"],
-    format_func=lambda x: lang_options[x],
-)
+# 选择模式
+tab_excel, tab_pdf = st.tabs(["📊 Excel 表格翻译", "📐 工程图纸脱敏翻译"])
 
-# 开始翻译
-if st.button("开始翻译", type="primary", disabled=not uploaded_file or not selected_langs or st.session_state.translating):
-    if not uploaded_file or not selected_langs:
-        st.stop()
-    if not api_key:
-        st.error("请在侧边栏输入 OpenAI API Key，或在服务器设置环境变量。")
-        st.stop()
+# ══════════════════════════════════════════════════════════════════════════════
+# Tab 1: Excel 翻译（原有功能）
+# ══════════════════════════════════════════════════════════════════════════════
 
-    st.session_state.translating = True
-    st.session_state.result_zip = None
-    client = OpenAI(api_key=api_key)
+with tab_excel:
+    uploaded_file = st.file_uploader("上传 Excel 文件", type=["xlsx", "xls"], key="excel_upload")
+    if uploaded_file is None:
+        st.session_state.result_zip = None
 
-    # 保存上传文件到临时目录
-    tmp_dir = tempfile.mkdtemp()
-    input_path = os.path.join(tmp_dir, uploaded_file.name)
-    with open(input_path, "wb") as f:
-        f.write(uploaded_file.getvalue())
+    lang_options = {"en": "English (英语)", "th": "Thai (泰语)", "my": "Burmese (缅甸语)"}
+    selected_langs = st.multiselect(
+        "目标语言",
+        options=list(lang_options.keys()),
+        default=["en", "th", "my"],
+        format_func=lambda x: lang_options[x],
+    )
 
-    ext = Path(uploaded_file.name).suffix.lower()
-    stem = Path(uploaded_file.name).stem
+    if st.button("开始翻译", type="primary", disabled=not uploaded_file or not selected_langs or st.session_state.translating, key="excel_btn"):
+        if not uploaded_file or not selected_langs:
+            st.stop()
+        if not api_key:
+            st.error("请在侧边栏输入 OpenAI API Key，或在服务器设置环境变量。")
+            st.stop()
 
-    # xls 自动转 xlsx（保留图片）
-    if ext == '.xls':
+        st.session_state.translating = True
+        st.session_state.result_zip = None
+        client = OpenAI(api_key=api_key)
+
+        # 保存上传文件到临时目录
+        tmp_dir = tempfile.mkdtemp()
+        input_path = os.path.join(tmp_dir, uploaded_file.name)
+        with open(input_path, "wb") as f:
+            f.write(uploaded_file.getvalue())
+
+        ext = Path(uploaded_file.name).suffix.lower()
+        stem = Path(uploaded_file.name).stem
+
+        # xls 自动转 xlsx（保留图片）
+        if ext == '.xls':
+            try:
+                st.info("检测到 .xls 格式，正在转换为 .xlsx（保留图片）...")
+                input_path = ensure_xlsx(input_path)
+            except Exception as e:
+                st.error(f".xls 转换失败: {e}。请手动用 WPS/Excel 另存为 .xlsx 后再上传。")
+                st.session_state.translating = False
+                st.stop()
+
+        # 读取文件
         try:
-            st.info("检测到 .xls 格式，正在转换为 .xlsx（保留图片）...")
-            input_path = ensure_xlsx(input_path)
+            cells, nrows, ncols, sheet_name = read_file(input_path)
         except Exception as e:
-            st.error(f".xls 转换失败: {e}。请手动用 WPS/Excel 另存为 .xlsx 后再上传。")
+            st.error(f"读取文件失败: {e}")
             st.session_state.translating = False
             st.stop()
 
-    # 读取文件
-    try:
-        cells, nrows, ncols, sheet_name = read_file(input_path)
-    except Exception as e:
-        st.error(f"读取文件失败: {e}")
-        st.session_state.translating = False
-        st.stop()
+        translatable = {k: v for k, v in cells.items() if is_translatable(v)}
+        st.info(f"共 {len(cells)} 个单元格，{len(translatable)} 个需要翻译")
 
-    translatable = {k: v for k, v in cells.items() if is_translatable(v)}
-    st.info(f"共 {len(cells)} 个单元格，{len(translatable)} 个需要翻译")
+        table_context = build_table_context(cells, nrows, ncols)
 
-    table_context = build_table_context(cells, nrows, ncols)
+        total_tokens = {"input": 0, "output": 0}
+        result_files = {}  # lang -> (filename, bytes)
 
-    total_tokens = {"input": 0, "output": 0}
-    result_files = {}  # lang -> (filename, bytes)
+        for lang in selected_langs:
+            lang_name = LANGUAGES[lang]
+            st.subheader(f"翻译为 {lang_name}")
+            progress = st.progress(0)
+            status = st.empty()
 
-    for lang in selected_langs:
-        lang_name = LANGUAGES[lang]
-        st.subheader(f"翻译为 {lang_name}")
-        progress = st.progress(0)
-        status = st.empty()
-
-        # 阶段一：术语表
-        status.text(f"提取 {lang_name} 术语表...")
-        try:
-            glossary, g_tokens = extract_glossary(client, translatable, lang)
-            total_tokens["input"] += g_tokens["input"]
-            total_tokens["output"] += g_tokens["output"]
-        except Exception as e:
-            st.error(f"术语提取失败: {e}")
-            continue
-
-        with st.expander(f"{lang_name} 术语表", expanded=False):
-            st.text(glossary)
-
-        # 阶段二：分批翻译
-        keys = sorted(translatable.keys())
-        batches = group_by_rows(keys, BATCH_SIZE)
-        all_translations = {}
-
-        for batch_idx, batch_keys in enumerate(batches):
-            rows_in_batch = sorted(set(r for r, c in batch_keys))
-            row_range = f"R{rows_in_batch[0]+1}-R{rows_in_batch[-1]+1}"
-            status.text(f"批次 {batch_idx+1}/{len(batches)} ({len(batch_keys)} 格, {row_range})...")
-            progress.progress((batch_idx + 1) / len(batches))
-
+            # 阶段一：术语表
+            status.text(f"提取 {lang_name} 术语表...")
             try:
-                result, b_tokens = translate_batch(
-                    client, batch_keys, translatable, table_context, glossary, lang
-                )
-                total_tokens["input"] += b_tokens["input"]
-                total_tokens["output"] += b_tokens["output"]
-                parsed = parse_translation_result(result)
-                all_translations.update(parsed)
+                glossary, g_tokens = extract_glossary(client, translatable, lang)
+                total_tokens["input"] += g_tokens["input"]
+                total_tokens["output"] += g_tokens["output"]
             except Exception as e:
-                st.warning(f"批次 {batch_idx+1} 失败: {e}，重试中...")
+                st.error(f"术语提取失败: {e}")
+                continue
+
+            with st.expander(f"{lang_name} 术语表", expanded=False):
+                st.text(glossary)
+
+            # 阶段二：分批翻译
+            keys = sorted(translatable.keys())
+            batches = group_by_rows(keys, BATCH_SIZE)
+            all_translations = {}
+
+            for batch_idx, batch_keys in enumerate(batches):
+                rows_in_batch = sorted(set(r for r, c in batch_keys))
+                row_range = f"R{rows_in_batch[0]+1}-R{rows_in_batch[-1]+1}"
+                status.text(f"批次 {batch_idx+1}/{len(batches)} ({len(batch_keys)} 格, {row_range})...")
+                progress.progress((batch_idx + 1) / len(batches))
+
                 try:
                     result, b_tokens = translate_batch(
                         client, batch_keys, translatable, table_context, glossary, lang
@@ -625,65 +643,182 @@ if st.button("开始翻译", type="primary", disabled=not uploaded_file or not s
                     total_tokens["output"] += b_tokens["output"]
                     parsed = parse_translation_result(result)
                     all_translations.update(parsed)
-                except Exception as e2:
-                    st.error(f"批次 {batch_idx+1} 再次失败: {e2}，已跳过")
+                except Exception as e:
+                    st.warning(f"批次 {batch_idx+1} 失败: {e}，重试中...")
+                    try:
+                        result, b_tokens = translate_batch(
+                            client, batch_keys, translatable, table_context, glossary, lang
+                        )
+                        total_tokens["input"] += b_tokens["input"]
+                        total_tokens["output"] += b_tokens["output"]
+                        parsed = parse_translation_result(result)
+                        all_translations.update(parsed)
+                    except Exception as e2:
+                        st.error(f"批次 {batch_idx+1} 再次失败: {e2}，已跳过")
 
-        # 补上不需要翻译的单元格
-        for k, v in cells.items():
-            if k not in all_translations:
-                all_translations[k] = v
+            # 补上不需要翻译的单元格
+            for k, v in cells.items():
+                if k not in all_translations:
+                    all_translations[k] = v
 
-        # 保存结果
-        output_filename = f"{stem}_{lang}.xlsx"
-        output_path = os.path.join(tmp_dir, output_filename)
-        try:
-            save_translated_xlsx(input_path, all_translations, output_path)
-            with open(output_path, "rb") as f:
-                result_files[lang] = (output_filename, f.read())
-            status.text(f"{lang_name} 翻译完成！{len(all_translations)} 个单元格")
-        except Exception as e:
-            st.error(f"保存 {lang_name} 结果失败: {e}")
+            # 保存结果
+            output_filename = f"{stem}_{lang}.xlsx"
+            output_path = os.path.join(tmp_dir, output_filename)
+            try:
+                save_translated_xlsx(input_path, all_translations, output_path)
+                with open(output_path, "rb") as f:
+                    result_files[lang] = (output_filename, f.read())
+                status.text(f"{lang_name} 翻译完成！{len(all_translations)} 个单元格")
+            except Exception as e:
+                st.error(f"保存 {lang_name} 结果失败: {e}")
 
-    # 打包所有结果为 zip
-    if result_files:
-        import io
-        zip_buffer = io.BytesIO()
-        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
-            for lang, (filename, data) in result_files.items():
-                zf.writestr(filename, data)
-        zip_buffer.seek(0)
+        # 打包所有结果为 zip
+        if result_files:
+            import io
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for lang, (filename, data) in result_files.items():
+                    zf.writestr(filename, data)
+            zip_buffer.seek(0)
 
-        st.session_state.result_zip = zip_buffer.getvalue()
-        st.session_state.result_filename = f"{stem}_translated.zip"
+            st.session_state.result_zip = zip_buffer.getvalue()
+            st.session_state.result_filename = f"{stem}_translated.zip"
 
-        # 费用统计
-        model = DEFAULT_MODEL
-        pricing = PRICING.get(model, {"input": 0, "output": 0})
-        input_cost = total_tokens["input"] / 1_000_000 * pricing["input"]
-        output_cost = total_tokens["output"] / 1_000_000 * pricing["output"]
-        total_cost = input_cost + output_cost
-        st.session_state.result_cost = {
-            "total": total_cost,
-            "input_tokens": total_tokens["input"],
-            "output_tokens": total_tokens["output"],
-        }
+            # 费用统计
+            model = DEFAULT_MODEL
+            pricing = PRICING.get(model, {"input": 0, "output": 0})
+            input_cost = total_tokens["input"] / 1_000_000 * pricing["input"]
+            output_cost = total_tokens["output"] / 1_000_000 * pricing["output"]
+            total_cost = input_cost + output_cost
+            st.session_state.result_cost = {
+                "total": total_cost,
+                "input_tokens": total_tokens["input"],
+                "output_tokens": total_tokens["output"],
+            }
 
-    st.session_state.translating = False
-    st.rerun()
+        st.session_state.translating = False
+        st.rerun()
 
-# 显示结果（持久化，不会因为点击下载而消失）
-if st.session_state.result_zip:
-    st.divider()
-    st.success("翻译完成！")
+    # 显示结果（持久化，不会因为点击下载而消失）
+    if st.session_state.result_zip:
+        st.divider()
+        st.success("翻译完成！")
 
-    if st.session_state.result_cost:
-        cost = st.session_state.result_cost
-        st.metric("本次费用", f"${cost['total']:.4f}",
-                  help=f"Input: {cost['input_tokens']:,} tokens, Output: {cost['output_tokens']:,} tokens")
+        if st.session_state.result_cost:
+            cost = st.session_state.result_cost
+            st.metric("本次费用", f"${cost['total']:.4f}",
+                      help=f"Input: {cost['input_tokens']:,} tokens, Output: {cost['output_tokens']:,} tokens")
 
-    st.download_button(
-        label="📥 下载全部翻译结果 (zip)",
-        data=st.session_state.result_zip,
-        file_name=st.session_state.result_filename,
-        mime="application/zip",
-    )
+        st.download_button(
+            label="📥 下载全部翻译结果 (zip)",
+            data=st.session_state.result_zip,
+            file_name=st.session_state.result_filename,
+            mime="application/zip",
+            key="excel_download",
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Tab 2: 工程图纸脱敏翻译
+# ══════════════════════════════════════════════════════════════════════════════
+
+with tab_pdf:
+    st.caption("上传工程图纸 PDF → 自动脱敏（删除签名栏/标题栏）+ 翻译技术注释")
+
+    pdf_file = st.file_uploader("上传工程图纸 PDF", type=["pdf"], key="pdf_upload")
+    if pdf_file is None:
+        st.session_state.pdf_result = None
+
+    if st.button("开始处理", type="primary",
+                 disabled=not pdf_file or st.session_state.pdf_processing,
+                 key="pdf_btn"):
+        if not api_key:
+            st.error("请在侧边栏输入 OpenAI API Key")
+            st.stop()
+        if not baidu_api_key or not baidu_secret_key:
+            st.error("请设置环境变量 BAIDU_API_KEY 和 BAIDU_SECRET_KEY（百度 OCR）")
+            st.stop()
+
+        st.session_state.pdf_processing = True
+        st.session_state.pdf_result = None
+
+        # 导入图纸处理模块
+        import sys
+        gjr_path = str(Path(__file__).resolve().parent / "gjr")
+        if gjr_path not in sys.path:
+            sys.path.insert(0, gjr_path)
+        import run_redact_v2 as redact
+
+        # 设置 API clients
+        redact.set_client(OpenAI(api_key=api_key))
+        os.environ["BAIDU_API_KEY"] = baidu_api_key
+        os.environ["BAIDU_SECRET_KEY"] = baidu_secret_key
+
+        # 保存上传文件
+        tmp_dir = tempfile.mkdtemp()
+        input_path = os.path.join(tmp_dir, pdf_file.name)
+        with open(input_path, "wb") as f:
+            f.write(pdf_file.getvalue())
+
+        output_dir = os.path.join(tmp_dir, "output")
+        os.makedirs(output_dir, exist_ok=True)
+        stem = Path(pdf_file.name).stem
+
+        # 获取页数
+        import fitz
+        doc = fitz.open(input_path)
+        num_pages = len(doc)
+        doc.close()
+
+        # 复制原 PDF 作为输出基础
+        import shutil
+        output_path = os.path.join(output_dir, pdf_file.name)  # 保持原文件名
+        shutil.copy2(input_path, output_path)
+
+        st.info(f"处理: {pdf_file.name} ({num_pages} 页)")
+        progress = st.progress(0)
+        status = st.empty()
+        all_products = []
+
+        for page_num in range(num_pages):
+            status.text(f"处理第 {page_num+1}/{num_pages} 页...")
+            progress.progress((page_num + 0.5) / num_pages)
+
+            try:
+                product_name, decisions = redact.process_page(
+                    input_path, output_path, page_num,
+                    Path(output_dir), stem,
+                )
+                if product_name:
+                    all_products.append(product_name)
+                delete_count = sum(1 for d in decisions.values() if d == "DELETE")
+                keep_count = sum(1 for d in decisions.values() if d == "KEEP")
+                status.text(f"第 {page_num+1} 页: {keep_count} 保留, {delete_count} 删除")
+            except Exception as e:
+                st.warning(f"第 {page_num+1} 页处理出错: {e}")
+
+            progress.progress((page_num + 1) / num_pages)
+
+        # 读取结果
+        with open(output_path, "rb") as f:
+            result_bytes = f.read()
+
+        product = all_products[0] if all_products else "未识别"
+        st.session_state.pdf_result = result_bytes
+        st.session_state.pdf_filename = pdf_file.name  # 保持原文件名
+        st.session_state.pdf_product = product
+        st.session_state.pdf_pages = num_pages
+        st.session_state.pdf_processing = False
+        st.rerun()
+
+    # 显示 PDF 结果
+    if st.session_state.pdf_result:
+        st.divider()
+        st.success(f"处理完成！产品: {st.session_state.get('pdf_product', '?')}, {st.session_state.get('pdf_pages', '?')} 页")
+        st.download_button(
+            label="📥 下载脱敏翻译后的 PDF",
+            data=st.session_state.pdf_result,
+            file_name=st.session_state.pdf_filename,
+            mime="application/pdf",
+            key="pdf_download",
+        )

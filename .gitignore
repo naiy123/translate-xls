@@ -33,3 +33,8 @@ output/
 *.pt
 *.bin
 24079f34b20c56f7dedbb7507f4ed0c2_1.pdf
+
+# GJR test files
+gjr/output/
+gjr/*.pdf
+gjr/*.xls
