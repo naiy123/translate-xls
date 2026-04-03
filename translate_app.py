@@ -785,10 +785,13 @@ with tab_pdf:
             progress.progress((page_num + 0.5) / num_pages)
 
             try:
-                product_name, decisions = redact.process_page(
-                    input_path, output_path, page_num,
-                    Path(output_dir), stem,
-                )
+                import io, contextlib
+                log_buf = io.StringIO()
+                with contextlib.redirect_stdout(log_buf):
+                    product_name, decisions = redact.process_page(
+                        input_path, output_path, page_num,
+                        Path(output_dir), stem,
+                    )
                 if product_name:
                     all_products.append(product_name)
                 delete_count = sum(1 for d in decisions.values() if d == "DELETE")
