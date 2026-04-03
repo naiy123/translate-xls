@@ -723,14 +723,19 @@ with tab_excel:
 # ══════════════════════════════════════════════════════════════════════════════
 
 with tab_pdf:
-    st.caption("上传工程图纸 PDF → 自动脱敏（删除签名栏/标题栏）+ 翻译技术注释")
+    st.caption("上传工程图纸 PDF 或 ZIP 压缩包 → 自动脱敏 + 翻译（只处理文件名含 lay/drw 的 PDF）")
 
-    pdf_file = st.file_uploader("上传工程图纸 PDF", type=["pdf"], key="pdf_upload")
-    if pdf_file is None:
+    uploaded_files = st.file_uploader(
+        "上传 PDF 文件或 ZIP 压缩包",
+        type=["pdf", "zip"],
+        accept_multiple_files=True,
+        key="pdf_upload",
+    )
+    if not uploaded_files:
         st.session_state.pdf_result = None
 
     if st.button("开始处理", type="primary",
-                 disabled=not pdf_file or st.session_state.pdf_processing,
+                 disabled=not uploaded_files or st.session_state.pdf_processing,
                  key="pdf_btn"):
         if not api_key:
             st.error("请在侧边栏输入 OpenAI API Key")
@@ -754,74 +759,123 @@ with tab_pdf:
         os.environ["BAIDU_API_KEY"] = baidu_api_key
         os.environ["BAIDU_SECRET_KEY"] = baidu_secret_key
 
-        # 保存上传文件
         tmp_dir = tempfile.mkdtemp()
-        input_path = os.path.join(tmp_dir, pdf_file.name)
-        with open(input_path, "wb") as f:
-            f.write(pdf_file.getvalue())
-
+        input_dir = os.path.join(tmp_dir, "input")
         output_dir = os.path.join(tmp_dir, "output")
+        os.makedirs(input_dir, exist_ok=True)
         os.makedirs(output_dir, exist_ok=True)
-        stem = Path(pdf_file.name).stem
 
-        # 获取页数
-        import fitz
-        doc = fitz.open(input_path)
-        num_pages = len(doc)
-        doc.close()
+        # 收集所有 PDF 文件（支持直接上传 + ZIP 解压）
+        pdf_paths = []
+        for uf in uploaded_files:
+            save_path = os.path.join(input_dir, uf.name)
+            with open(save_path, "wb") as f:
+                f.write(uf.getvalue())
+            if uf.name.lower().endswith(".zip"):
+                # 解压 ZIP
+                import zipfile as _zf
+                with _zf.ZipFile(save_path, 'r') as zf:
+                    for name in zf.namelist():
+                        if name.lower().endswith(".pdf") and not name.startswith("__MACOSX"):
+                            zf.extract(name, input_dir)
+                            pdf_paths.append(os.path.join(input_dir, name))
+            else:
+                pdf_paths.append(save_path)
 
-        # 复制原 PDF 作为输出基础
-        import shutil
-        output_path = os.path.join(output_dir, pdf_file.name)  # 保持原文件名
-        shutil.copy2(input_path, output_path)
+        # 过滤：只处理文件名含 "lay" 或 "drw" 的 PDF（连续匹配）
+        def should_process(filename):
+            name_lower = filename.lower()
+            return "lay" in name_lower or "drw" in name_lower
 
-        st.info(f"处理: {pdf_file.name} ({num_pages} 页)")
+        filtered_paths = [p for p in pdf_paths if should_process(os.path.basename(p))]
+        skipped = [os.path.basename(p) for p in pdf_paths if not should_process(os.path.basename(p))]
+
+        if skipped:
+            st.info(f"跳过 {len(skipped)} 个文件（不含 lay/drw）: {', '.join(skipped[:5])}")
+        if not filtered_paths:
+            st.warning("没有符合条件的 PDF 文件（文件名需包含 lay 或 drw）")
+            st.session_state.pdf_processing = False
+            st.stop()
+
+        st.info(f"处理 {len(filtered_paths)} 个文件")
         progress = st.progress(0)
         status = st.empty()
-        all_products = []
+        result_files = {}  # filename -> bytes
 
-        for page_num in range(num_pages):
-            status.text(f"处理第 {page_num+1}/{num_pages} 页...")
-            progress.progress((page_num + 0.5) / num_pages)
+        for fi, input_path in enumerate(filtered_paths):
+            import fitz
+            import shutil
+            filename = os.path.basename(input_path)
+            stem = Path(filename).stem
 
-            try:
-                import io, contextlib
-                log_buf = io.StringIO()
-                with contextlib.redirect_stdout(log_buf):
-                    product_name, decisions = redact.process_page(
-                        input_path, output_path, page_num,
-                        Path(output_dir), stem,
-                    )
-                if product_name:
-                    all_products.append(product_name)
-                delete_count = sum(1 for d in decisions.values() if d == "DELETE")
-                keep_count = sum(1 for d in decisions.values() if d == "KEEP")
-                status.text(f"第 {page_num+1} 页: {keep_count} 保留, {delete_count} 删除")
-            except Exception as e:
-                st.warning(f"第 {page_num+1} 页处理出错: {e}")
+            doc = fitz.open(input_path)
+            num_pages = len(doc)
+            doc.close()
 
-            progress.progress((page_num + 1) / num_pages)
+            output_path = os.path.join(output_dir, filename)
+            shutil.copy2(input_path, output_path)
 
-        # 读取结果
-        with open(output_path, "rb") as f:
-            result_bytes = f.read()
+            status.text(f"[{fi+1}/{len(filtered_paths)}] {filename} ({num_pages} 页)")
 
-        product = all_products[0] if all_products else "未识别"
-        st.session_state.pdf_result = result_bytes
-        st.session_state.pdf_filename = pdf_file.name  # 保持原文件名
-        st.session_state.pdf_product = product
-        st.session_state.pdf_pages = num_pages
+            for page_num in range(num_pages):
+                pct = (fi + (page_num + 0.5) / num_pages) / len(filtered_paths)
+                progress.progress(min(pct, 1.0))
+                status.text(f"[{fi+1}/{len(filtered_paths)}] {filename} 第 {page_num+1}/{num_pages} 页")
+
+                try:
+                    import io, contextlib
+                    log_buf = io.StringIO()
+                    with contextlib.redirect_stdout(log_buf):
+                        product_name, decisions = redact.process_page(
+                            input_path, output_path, page_num,
+                            Path(output_dir), stem,
+                        )
+                except Exception as e:
+                    st.warning(f"{filename} 第 {page_num+1} 页出错: {e}")
+
+            # 压缩
+            _doc = fitz.open(output_path)
+            _doc.save(output_path + ".tmp", garbage=4, deflate=True)
+            _doc.close()
+            shutil.move(output_path + ".tmp", output_path)
+
+            with open(output_path, "rb") as f:
+                result_files[filename] = f.read()
+
+        progress.progress(1.0)
+        status.text("完成！")
+
+        # 打包结果
+        if len(result_files) == 1:
+            # 单文件直接下载 PDF
+            fname, data = next(iter(result_files.items()))
+            st.session_state.pdf_result = data
+            st.session_state.pdf_filename = fname
+        else:
+            # 多文件打包 ZIP
+            import io as _io
+            zip_buf = _io.BytesIO()
+            import zipfile as _zf2
+            with _zf2.ZipFile(zip_buf, 'w', _zf2.ZIP_DEFLATED) as zf:
+                for fname, data in result_files.items():
+                    zf.writestr(fname, data)
+            zip_buf.seek(0)
+            st.session_state.pdf_result = zip_buf.getvalue()
+            st.session_state.pdf_filename = "redacted_drawings.zip"
+
+        st.session_state.pdf_product = f"{len(result_files)} 个文件"
         st.session_state.pdf_processing = False
         st.rerun()
 
-    # 显示 PDF 结果
+    # 显示结果
     if st.session_state.pdf_result:
         st.divider()
-        st.success(f"处理完成！产品: {st.session_state.get('pdf_product', '?')}, {st.session_state.get('pdf_pages', '?')} 页")
+        st.success(f"处理完成！{st.session_state.get('pdf_product', '')}")
+        mime = "application/pdf" if st.session_state.pdf_filename.endswith(".pdf") else "application/zip"
         st.download_button(
-            label="📥 下载脱敏翻译后的 PDF",
+            label=f"📥 下载 {st.session_state.pdf_filename}",
             data=st.session_state.pdf_result,
             file_name=st.session_state.pdf_filename,
-            mime="application/pdf",
+            mime=mime,
             key="pdf_download",
         )
