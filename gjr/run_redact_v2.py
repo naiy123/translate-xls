@@ -82,22 +82,49 @@ def baidu_access_token():
 
 
 def ocr_pdf(pdf_path, page_num=1):
-    """百度高精度 OCR，返回 words_result"""
+    """百度高精度 OCR，先渲染为图片再识别（兼容纯矢量轮廓化 PDF）"""
+    import fitz as _fitz
     token = baidu_access_token()
-    with open(pdf_path, "rb") as f:
-        pdf_data = base64.b64encode(f.read()).decode()
+
+    # 渲染指定页为 PNG（控制最大边 4000px，百度 API 限制 4096）
+    doc = _fitz.open(pdf_path)
+    page = doc[page_num - 1]
+    max_dim = max(page.rect.width, page.rect.height)
+    scale = min(4000 / max_dim, 300 / 72)  # 最大 4000px 或 300DPI
+    pix = page.get_pixmap(matrix=_fitz.Matrix(scale, scale))
+    img_data = base64.b64encode(pix.tobytes("png")).decode()
+    doc.close()
+
     resp = requests.post(
         f"https://aip.baidubce.com/rest/2.0/ocr/v1/accurate?access_token={token}",
         data={
-            "pdf_file": pdf_data,
-            "pdf_file_num": str(page_num),
+            "image": img_data,
             "recognize_granularity": "small",
             "detect_direction": "false",
             "probability": "true",
         },
         headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=60,
     )
-    return resp.json()
+    result = resp.json()
+
+    # 坐标从图片像素空间转回 PDF 点空间
+    if "words_result" in result:
+        for w in result["words_result"]:
+            loc = w.get("location", {})
+            loc["left"] = loc.get("left", 0) / scale
+            loc["top"] = loc.get("top", 0) / scale
+            loc["width"] = loc.get("width", 0) / scale
+            loc["height"] = loc.get("height", 0) / scale
+            if "chars" in w:
+                for ch in w["chars"]:
+                    cl = ch.get("location", {})
+                    cl["left"] = cl.get("left", 0) / scale
+                    cl["top"] = cl.get("top", 0) / scale
+                    cl["width"] = cl.get("width", 0) / scale
+                    cl["height"] = cl.get("height", 0) / scale
+
+    return result
 
 
 # ══════════════════════════════════════════════════════════════
