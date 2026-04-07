@@ -104,7 +104,7 @@ def ocr_pdf(pdf_path, page_num=1):
             "probability": "true",
         },
         headers={"Content-Type": "application/x-www-form-urlencoded"},
-        timeout=60,
+        timeout=120,
     )
     result = resp.json()
 
