@@ -1058,6 +1058,52 @@ def process_page(pdf_path, output_path, page_num, output_dir, stem):
             if rx1 < rx2 and ry1 < ry2:
                 page_obj.add_redact_annot(fitz.Rect(rx1, ry1, rx2, ry2), fill=(1, 1, 1))
 
+    # (1.5) KEEP block 内品牌关键词精确遮盖
+    BRAND_INLINE_PATS = [
+        re.compile(r'\bGE\s+APPLIANCES\b', re.IGNORECASE),
+        re.compile(r'\bGENERAL\s+ELECTRIC\b', re.IGNORECASE),
+        re.compile(r'\bGEA\b', re.IGNORECASE),
+        re.compile(r'(?<!\w)GE(?!\w)'),  # 独立 GE（不匹配 EDGE 等）
+        re.compile(r'\bROPER\s+CORP\.?\b', re.IGNORECASE),
+        re.compile(r'\bHAIER\b', re.IGNORECASE),
+    ]
+    brand_mask_count = 0
+    for w in ocr_result.get("words_result", []):
+        text = w["words"]
+        chars = w.get("chars", [])
+        if not chars:
+            continue
+        # 建立 text index → chars index 的映射（chars 不含空格）
+        text_to_char = {}
+        ci = 0
+        for ti, ch in enumerate(text):
+            if ch == ' ':
+                continue
+            if ci < len(chars):
+                text_to_char[ti] = ci
+                ci += 1
+        for pat in BRAND_INLINE_PATS:
+            for m in pat.finditer(text):
+                # 找匹配范围内第一个和最后一个非空格字符对应的 chars 索引
+                first_ci, last_ci = None, None
+                for ti in range(m.start(), m.end()):
+                    if ti in text_to_char:
+                        if first_ci is None:
+                            first_ci = text_to_char[ti]
+                        last_ci = text_to_char[ti]
+                if first_ci is not None and last_ci is not None:
+                    c_start = chars[first_ci]["location"]
+                    c_end = chars[last_ci]["location"]
+                    rx1 = c_start["left"] - 2
+                    ry1 = c_start["top"] - 2
+                    rx2 = c_end["left"] + c_end["width"] + 2
+                    ry2 = max(c_start["top"] + c_start.get("height", 20),
+                              c_end["top"] + c_end.get("height", 20)) + 2
+                    page_obj.add_redact_annot(fitz.Rect(rx1, ry1, rx2, ry2), fill=(1, 1, 1))
+                    brand_mask_count += 1
+    if brand_mask_count:
+        print(f"    品牌关键词遮盖: {brand_mask_count} 处")
+
     page_obj.apply_redactions()
 
     # (2) 重画框线
