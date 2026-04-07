@@ -1094,11 +1094,12 @@ def process_page(pdf_path, output_path, page_num, output_dir, stem):
                 if first_ci is not None and last_ci is not None:
                     c_start = chars[first_ci]["location"]
                     c_end = chars[last_ci]["location"]
-                    rx1 = c_start["left"] - 2
-                    ry1 = c_start["top"] - 2
-                    rx2 = c_end["left"] + c_end["width"] + 2
-                    ry2 = max(c_start["top"] + c_start.get("height", 20),
-                              c_end["top"] + c_end.get("height", 20)) + 2
+                    # 用行级 bbox 的 top/height，避免遮盖上下行
+                    line_loc = w["location"]
+                    rx1 = c_start["left"] - 1
+                    ry1 = line_loc["top"]
+                    rx2 = c_end["left"] + c_end["width"] + 1
+                    ry2 = line_loc["top"] + line_loc["height"]
                     page_obj.add_redact_annot(fitz.Rect(rx1, ry1, rx2, ry2), fill=(1, 1, 1))
                     brand_mask_count += 1
     if brand_mask_count:
