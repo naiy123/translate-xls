@@ -89,8 +89,7 @@ def ocr_pdf(pdf_path, page_num=1):
     # 渲染指定页为 PNG（控制最大边 4000px，百度 API 限制 4096）
     doc = _fitz.open(pdf_path)
     page = doc[page_num - 1]
-    max_dim = max(page.rect.width, page.rect.height)
-    scale = min(4000 / max_dim, 300 / 72)  # 最大 4000px 或 300DPI
+    scale = 200 / 72  # 固定 200 DPI（图片约 3MB，在百度 10MB 限制内）
     pix = page.get_pixmap(matrix=_fitz.Matrix(scale, scale))
     img_data = base64.b64encode(pix.tobytes("png")).decode()
     doc.close()
@@ -102,6 +101,7 @@ def ocr_pdf(pdf_path, page_num=1):
             "recognize_granularity": "small",
             "detect_direction": "false",
             "probability": "true",
+            "language_type": "ENG",
         },
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         timeout=120,
@@ -131,9 +131,7 @@ def ocr_pdf(pdf_path, page_num=1):
 # Step 2: 预处理 — 聚类 + snap
 # ══════════════════════════════════════════════════════════════
 
-Y_GAP = 30
-X_GAP = 80
-INTERNAL_Y_GAP = 50
+DBSCAN_EPS = 30      # DBSCAN 邻域半径（bbox 边缘间距，单位 pt）
 SNAP_MARGIN = 50
 ROW_OVERLAP = 0.3
 
@@ -177,47 +175,55 @@ def filter_noise(items):
     return result
 
 
-def cluster_blocks(items):
+def _bbox_gap(a, b):
+    """两个 bbox 边缘间的切比雪夫距离（X/Y 间距取较大者，重叠返回 0）"""
+    dx = max(0, max(a["left"] - b["right"], b["left"] - a["right"]))
+    dy = max(0, max(a["top"] - b["bottom"], b["top"] - a["bottom"]))
+    return max(dx, dy)
+
+
+def cluster_blocks(items, eps=DBSCAN_EPS):
+    """
+    DBSCAN 二维空间聚类（手写实现，零依赖）。
+
+    距离度量：两个 bbox 边缘间的切比雪夫距离。
+    解决旧算法的桥接问题——不同区域即使 Y 重叠，X 间距大也不会连通。
+    """
     if not items:
         return []
-    sorted_y = sorted(items, key=lambda it: it["top"])
-    bands, band = [], [sorted_y[0]]
-    for it in sorted_y[1:]:
-        if it["top"] - max(x["bottom"] for x in band) > Y_GAP:
-            bands.append(band)
-            band = [it]
-        else:
-            band.append(it)
-    bands.append(band)
+    if len(items) == 1:
+        return [items]
 
-    blocks = []
-    for band in bands:
-        sx = sorted(band, key=lambda it: it["left"])
-        blk = [sx[0]]
-        for it in sx[1:]:
-            if it["left"] - max(x["right"] for x in blk) > X_GAP:
-                blocks.append(blk)
-                blk = [it]
-            else:
-                blk.append(it)
-        blocks.append(blk)
+    n = len(items)
+    visited = [False] * n
+    labels = [-1] * n
+    cluster_id = 0
 
-    # 二次 Y 切分
-    split = []
-    for blk in blocks:
-        sy = sorted(blk, key=lambda it: it["top"])
-        sub = [sy[0]]
-        for it in sy[1:]:
-            if it["top"] - max(x["bottom"] for x in sub) > INTERNAL_Y_GAP:
-                split.append(sub)
-                sub = [it]
-            else:
-                sub.append(it)
-        split.append(sub)
+    for i in range(n):
+        if visited[i]:
+            continue
+        visited[i] = True
+        labels[i] = cluster_id
+        queue = [i]
+        while queue:
+            p = queue.pop(0)
+            for j in range(n):
+                if visited[j]:
+                    continue
+                if _bbox_gap(items[p], items[j]) <= eps:
+                    visited[j] = True
+                    labels[j] = cluster_id
+                    queue.append(j)
+        cluster_id += 1
 
-    if len(split) > len(blocks):
-        print(f"  二次切分: {len(blocks)} → {len(split)} 个 block")
-    return split
+    # 按标签分组
+    clusters = {}
+    for i, label in enumerate(labels):
+        clusters.setdefault(label, []).append(items[i])
+
+    # 按 block 的 Y 位置排序
+    blocks = sorted(clusters.values(), key=lambda b: min(it["top"] for it in b))
+    return blocks
 
 
 def extract_lines(pdf_path):
@@ -607,9 +613,36 @@ def fallback_product_name(ocr_result, page_h):
 
     # 取最大字号的
     candidates.sort(key=lambda x: -x[0])
-    best = candidates[0][1]
-    print(f"    OCR fallback 产品名: \"{best}\" (字高={candidates[0][0]})")
-    return best
+    best_h = candidates[0][0]
+    best_text = candidates[0][1]
+
+    # 合并同一 Y 行、相近字号的相邻 item（如 MOUNT + EVAP + FAN）
+    # 用全量 OCR 结果（包含被噪音过滤的短词如 FAN）
+    best_y = None
+    for w in ocr_result.get("words_result", []):
+        if w["words"].strip() == best_text:
+            best_y = w["location"]["top"]
+            break
+
+    if best_y is not None:
+        row_items = []
+        for w in ocr_result.get("words_result", []):
+            loc = w["location"]
+            # 同一行（Y 重叠）+ 相近字号（±30%）
+            if abs(loc["top"] - best_y) < best_h and abs(loc["height"] - best_h) < best_h * 0.3:
+                if loc["top"] > title_y_start:
+                    text = w["words"].strip()
+                    if DWG_PAT.search(text):
+                        continue
+                    row_items.append((loc["left"], text))
+        if row_items:
+            row_items.sort()
+            merged = " ".join(t for _, t in row_items)
+            if len(merged) > len(best_text):
+                best_text = merged
+
+    print(f"    OCR fallback 产品名: \"{best_text}\" (字高={best_h})")
+    return best_text
 
 
 def find_product_bbox(items, product_name):
@@ -785,40 +818,60 @@ def translate_block(block_text, block_image):
     return result
 
 
-def find_white_space(pdf_path, block_bbox, all_bboxes, page_w, page_h, trans_w, trans_h):
+def find_white_space(pdf_path, block_bbox, all_bboxes, page_w, page_h, trans_w, trans_h,
+                     page_img=None, inner_rect=None):
     """
     在 block 附近找到白色空白区域放置翻译。
+    使用像素级白色检测避免覆盖图纸内容。
 
-    优先级：左侧 → 下方 → 上方 → 右侧
+    优先级：左侧 → 下方 → 上方
     """
     bx1, by1, bx2, by2 = block_bbox
-    gap = 10  # 和原 block 的间距
+    gap = 15
+
+    # 内框约束
+    ix1 = inner_rect[0] if inner_rect else 72
+    iy1 = inner_rect[1] if inner_rect else 36
+    ix2 = inner_rect[2] if inner_rect else page_w - 72
+    iy2 = inner_rect[3] if inner_rect else page_h - 36
 
     candidates = [
-        # 左侧
-        (bx1 - trans_w - gap, by1, bx1 - gap, by1 + trans_h),
-        # 下方
-        (bx1, by2 + gap, bx1 + trans_w, by2 + gap + trans_h),
-        # 上方
-        (bx1, by1 - trans_h - gap, bx1 + trans_w, by1 - gap),
+        (bx1 - trans_w - gap, by1, bx1 - gap, by1 + trans_h),       # 左侧
+        (bx1, by2 + gap, bx1 + trans_w, by2 + gap + trans_h),       # 下方
+        (bx1, by1 - trans_h - gap, bx1 + trans_w, by1 - gap),       # 上方
     ]
 
-    for cx1, cy1, cx2, cy2 in candidates:
-        # 边界检查
-        if cx1 < 30 or cy1 < 30 or cx2 > page_w - 30 or cy2 > page_h - 30:
-            continue
-        # 检查是否和其他 block 重叠
-        overlap = False
+    def is_area_clear(cx1, cy1, cx2, cy2):
+        # 边界检查（内框内）
+        if cx1 < ix1 + 5 or cy1 < iy1 + 5 or cx2 > ix2 - 5 or cy2 > iy2 - 5:
+            return False
+        # block 碰撞检查
         for obx1, oby1, obx2, oby2 in all_bboxes:
             if not (cx2 < obx1 or cx1 > obx2 or cy2 < oby1 or cy1 > oby2):
-                overlap = True
-                break
-        if not overlap:
+                return False
+        # 像素级白色检查
+        if page_img is not None:
+            img_w, img_h = page_img.size
+            sx, sy = img_w / page_w, img_h / page_h
+            px1 = max(0, int(cx1 * sx))
+            py1 = max(0, int(cy1 * sy))
+            px2 = min(img_w, int(cx2 * sx))
+            py2 = min(img_h, int(cy2 * sy))
+            if px2 > px1 and py2 > py1:
+                import numpy as np
+                region = np.array(page_img.crop((px1, py1, px2, py2)))
+                white_ratio = np.mean(region > 230)
+                if white_ratio < 0.9:  # 非白色区域 > 10% → 不放
+                    return False
+        return True
+
+    for cx1, cy1, cx2, cy2 in candidates:
+        if is_area_clear(cx1, cy1, cx2, cy2):
             return (cx1, cy1, cx2, cy2)
 
-    # fallback: 强制放在左侧，即使超出边界也 clamp
-    return (max(30, bx1 - trans_w - gap), by1,
-            max(30 + trans_w, bx1 - gap), by1 + trans_h)
+    # fallback: 左侧 clamp 到内框内
+    return (max(ix1 + 5, bx1 - trans_w - gap), by1,
+            max(ix1 + 5 + trans_w, bx1 - gap), by1 + trans_h)
 
 
 def batch_translate_labels(blocks, indices, block_texts):
@@ -1207,27 +1260,47 @@ def process_page(pdf_path, output_path, page_num, output_dir, stem):
     shape.finish(color=(0, 0, 0), width=0.5)
     shape.commit()
 
-    # (3) 渲染产品名
+    # (3) 渲染产品名（仅当原位已被涂白时才写回，避免叠加）
     if product_name and product_bbox:
         bx1, by1, bx2, by2 = product_bbox
-        fontsize = max(10, (by2 - by1) * 0.8)
-        text_w = len(product_name) * fontsize * 0.5
-        x = bx1 + ((bx2-bx1) - text_w) / 2 if text_w < (bx2-bx1) else bx1
-        page_obj.insert_text(fitz.Point(x, by2 - (by2-by1)*0.15), product_name,
-                             fontsize=fontsize, fontname="helv", color=(0, 0, 0))
-        print(f"    产品名: \"{product_name}\" 字号={fontsize:.0f}")
+        # 检查产品名位置是否在某个 DELETE block 内
+        in_deleted = False
+        for bi2 in range(len(blocks)):
+            if decisions.get(bi2) == "DELETE":
+                dbx1, dby1, dbx2, dby2 = snapped_bboxes[bi2]
+                if bx1 >= dbx1 - 10 and by1 >= dby1 - 10 and bx2 <= dbx2 + 10 and by2 <= dby2 + 10:
+                    in_deleted = True
+                    break
+        if in_deleted:
+            fontsize = max(10, (by2 - by1) * 0.8)
+            text_w = len(product_name) * fontsize * 0.5
+            x = bx1 + ((bx2-bx1) - text_w) / 2 if text_w < (bx2-bx1) else bx1
+            page_obj.insert_text(fitz.Point(x, by2 - (by2-by1)*0.15), product_name,
+                                 fontsize=fontsize, fontname="helv", color=(0, 0, 0))
+            print(f"    产品名: \"{product_name}\" 字号={fontsize:.0f} (回写)")
+        else:
+            print(f"    产品名: \"{product_name}\" (原位保留，不回写)")
+
+    # 渲染原始页面图片用于白色检测
+    from PIL import Image as _Image
+    _src_doc = fitz.open(str(pdf_path))
+    _src_pix = _src_doc[page_num].get_pixmap(matrix=fitz.Matrix(1, 1))  # 1:1 低分辨率够用
+    page_img = _Image.frombytes("RGB", (_src_pix.width, _src_pix.height), _src_pix.samples)
+    _src_doc.close()
+    _inner_rect = (ix1, iy1, ix2, iy2)
 
     # (4) 大块翻译注释
     all_bboxes = list(snapped_bboxes)
     for bi, trans_text in big_translations.items():
         lines = trans_text.split("\n")
-        fontsize = 9
-        line_height = fontsize * 1.6
+        fontsize = 11
+        line_height = fontsize * 1.5
         trans_h = len(lines) * line_height + 10
         max_line_len = max(len(l) for l in lines) if lines else 10
-        trans_w = max(200, min(max_line_len * fontsize * 0.55, snapped_bboxes[bi][2] - snapped_bboxes[bi][0]))
+        trans_w = max(250, min(max_line_len * fontsize * 0.6, snapped_bboxes[bi][2] - snapped_bboxes[bi][0]))
 
-        pos = find_white_space(str(pdf_path), snapped_bboxes[bi], all_bboxes, pw, ph, trans_w, trans_h)
+        pos = find_white_space(str(pdf_path), snapped_bboxes[bi], all_bboxes, pw, ph, trans_w, trans_h,
+                               page_img=page_img, inner_rect=_inner_rect)
         rect = fitz.Rect(pos[0], pos[1], pos[2], pos[3])
         all_bboxes.append(pos)
 
