@@ -1110,14 +1110,13 @@ def process_page(pdf_path, output_path, page_num, output_dir, stem):
                 if first_ci is not None and last_ci is not None:
                     c_start = chars[first_ci]["location"]
                     c_end = chars[last_ci]["location"]
-                    # 用行级 bbox 高度的 75% 居中，匹配矢量文字实际高度
+                    # 上部缩 20%（避免覆盖上面的内容），下部不缩（完全覆盖文字底部）
                     line_loc = w["location"]
                     line_h = line_loc["height"]
-                    shrink = line_h * 0.125  # 上下各缩 12.5%
                     rx1 = c_start["left"] - 1
-                    ry1 = line_loc["top"] + shrink
+                    ry1 = line_loc["top"] + line_h * 0.2   # 顶部往下缩 20%
                     rx2 = c_end["left"] + c_end["width"] + 1
-                    ry2 = line_loc["top"] + line_h - shrink
+                    ry2 = line_loc["top"] + line_h          # 底部不缩
                     page_obj.add_redact_annot(fitz.Rect(rx1, ry1, rx2, ry2), fill=(1, 1, 1))
                     brand_mask_count += 1
     if brand_mask_count:
