@@ -312,10 +312,12 @@ def classify_block(block):
       "AUTO_DELETE" → 已知要删除的内容（UNCONTROLLED IF PRINTED 等）
     """
     all_text = " ".join(it["text"] for it in block)
-    # 强制删除的已知内容
+    # 大块始终发 GPT（即使含 UNCONTROLLED 等，GPT 还需要提取产品名）
+    if len(block) > 4:
+        return "GPT"
+    # 小块强制删除的已知内容
     if any(p.search(all_text) for p in AUTO_DELETE_PATTERNS):
         return "AUTO_DELETE"
-    if len(block) > 4:
         return "GPT"
     # 含图号 → 可能是标题栏混合内容，发 GPT 判断
     if DWG_PAT.search(all_text):
