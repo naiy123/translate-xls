@@ -369,9 +369,18 @@ KEEP（整块保留）的区域：
 
 ## 任务 2：提取产品名称
 
-在标题栏中通常有一个产品名称（如 MOUNT EVAP FAN、MULLION BOTTOM QC 等），是图纸中最大最显眼的文字。请从所有 block 中找到这个产品名称并返回。
+在标题栏的 TITLE 区域中有一个产品名称，通常是描述性的英文词组，例如：
+  MOUNT EVAP FAN、MULLION BOTTOM QC、LINER DOOR、TRIM VENT LWR
 
-注意：OCR 可能漏字或误读，请结合图片判断完整的产品名。如果不确定，返回你从图片中看到的内容。
+产品名的特征：
+  - 是英文单词组成的描述性名称，不是编码
+  - 通常在标题栏中字号最大
+  - 位于 TITLE 标签旁边或下方
+
+注意区分：
+  - 产品名 ≠ 图号（如 191D7693、224D4488P001 这些是编码，不是产品名）
+  - 产品名 ≠ 公司名（如 ROPER CORP、GE APPLIANCES）
+  - 如果 OCR 漏字或误读，请结合图片判断完整的产品名
 
 ## few-shot 示例
 
@@ -389,7 +398,11 @@ Block: 中部右侧，NOTES / 1. MATERIAL: GALVANIZED STEEL... / 公差、折弯
 
 Block: 下部右侧，MOUNT EVAP FAN / 224D4488 / DRAWN C.VELMURUGAM / 06/06/16 / Released 等
 → DELETE（标题栏）
-→ 产品名: MOUNT EVAP FAN
+→ 产品名: MOUNT EVAP FAN（不是图号 224D4488）
+
+Block: 下部右侧，LINER DOOR / 191D7693 / ROPER CORP / DRAWN S.KANDUKUR / Released 等
+→ DELETE（标题栏）
+→ 产品名: LINER DOOR（不是图号 191D7693，不是公司名 ROPER CORP）
 
 ## 输出格式
 先逐行输出 block 判断：
@@ -553,6 +566,48 @@ def apply_redactions(pdf_path, output_path, blocks, snapped_bboxes, decisions):
 
     doc.save(output_path)
     doc.close()
+
+
+def fallback_product_name(ocr_result, page_h):
+    """
+    当 GPT 未返回产品名时，从 OCR 结果中推断。
+
+    策略：在标题栏区域（页面下部 20%）找 TITLE 标签附近、
+    字号最大的、非编码非公司名的英文词组。
+    """
+    title_y_start = page_h * 0.8
+    candidates = []
+
+    for w in ocr_result.get("words_result", []):
+        loc = w["location"]
+        text = w["words"].strip()
+        if loc["top"] < title_y_start:
+            continue
+        # 跳过编码（数字+字母混合，如 191D7693）
+        if DWG_PAT.search(text):
+            continue
+        # 跳过已知非产品名
+        skip_words = {"TITLE", "UNCONTROLLED", "PRINTED", "RELEASED", "STATUS",
+                      "SHEET", "DRAWN", "CHECKED", "ENGRG", "APPROVED", "DATE",
+                      "CLASS", "DO NOT SCALE", "THIS DRAWING", "ROPER", "CORP",
+                      "GE", "GEA", "GENERAL", "ELECTRIC", "APPLIANCES", "HAIER"}
+        if text.upper() in skip_words or any(s in text.upper() for s in ["TOLERANCE", "DECIMAL", "ANGLE", "FRACTION", "PROJECTION", "DIMENSION", "CONFORM", "PROCEDURE", "DISCLOSURE", "AGREEMENT", "INTERNAL"]):
+            continue
+        # 需要有意义的英文单词（至少一个 4+ 字母单词）
+        if not WORD_PAT.search(text):
+            continue
+        # 字号用 bbox 高度衡量
+        h = loc["height"]
+        candidates.append((h, text))
+
+    if not candidates:
+        return None
+
+    # 取最大字号的
+    candidates.sort(key=lambda x: -x[0])
+    best = candidates[0][1]
+    print(f"    OCR fallback 产品名: \"{best}\" (字高={candidates[0][0]})")
+    return best
 
 
 def find_product_bbox(items, product_name):
@@ -1014,6 +1069,23 @@ def process_page(pdf_path, output_path, page_num, output_dir, stem):
         decisions[bi] = "DELETE"
     for gi, bi in enumerate(gpt_indices):
         decisions[bi] = gpt_decisions.get(gi, "DELETE")
+
+    # GPT 未返回有效产品名时，用 OCR fallback
+    def _is_valid_product(name):
+        if not name:
+            return False
+        # GPT 可能返回 "未识别" 等中文说明
+        if re.search(r'[\u4e00-\u9fff]', name):
+            return False
+        # 图号不算产品名
+        if DWG_PAT.search(name):
+            return False
+        return True
+
+    if not _is_valid_product(product_name):
+        fb = fallback_product_name(ocr_result, ph)
+        if fb:
+            product_name = fb
 
     print(f"    产品名: {product_name or '未识别'}")
     delete_count = sum(1 for d in decisions.values() if d == "DELETE")
