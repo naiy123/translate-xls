@@ -295,16 +295,28 @@ WORD_PAT = re.compile(r'[A-Za-z]{4,}')
 DWG_PAT = re.compile(r'\d{3}[A-Z]\d{4}')
 
 
+# 已知要强制删除的关键词（不需要 GPT 判断）
+# 支持拆分识别：即使 OCR 把文字拆成多个 item，拼接后仍能匹配
+AUTO_DELETE_PATTERNS = [
+    re.compile(r'UNCONTROLLED', re.IGNORECASE),  # 不要求完整短语，单词足够判断
+    re.compile(r'DO\s*NOT\s*SCALE', re.IGNORECASE),
+]
+
+
 def classify_block(block):
     """
-    小 block 三级分类：
-      "GPT"       → 大块(>4 items)，发 GPT 判断 KEEP/DELETE
-      "AUTO_KEEP" → 纯尺寸或图号，自动保留，不翻译
-      "TRANSLATE" → 有意义英文文字，自动保留，纯文本翻译
+    小 block 分类：
+      "GPT"         → 大块(>4 items)，发 GPT 判断 KEEP/DELETE
+      "AUTO_KEEP"   → 纯尺寸，自动保留，不翻译
+      "TRANSLATE"   → 有意义英文文字，自动保留，纯文本翻译
+      "AUTO_DELETE" → 已知要删除的内容（UNCONTROLLED IF PRINTED 等）
     """
+    all_text = " ".join(it["text"] for it in block)
+    # 强制删除的已知内容
+    if any(p.search(all_text) for p in AUTO_DELETE_PATTERNS):
+        return "AUTO_DELETE"
     if len(block) > 4:
         return "GPT"
-    all_text = " ".join(it["text"] for it in block)
     # 含图号 → 可能是标题栏混合内容，发 GPT 判断
     if DWG_PAT.search(all_text):
         return "GPT"
@@ -950,16 +962,18 @@ def process_page(pdf_path, output_path, page_num, output_dir, stem):
     print(f"    {len(items)} 行 → {len(blocks)} 个 block")
 
     # ── 预分类 ──
-    gpt_indices, auto_keep_indices, translate_indices = [], [], []
+    gpt_indices, auto_keep_indices, translate_indices, auto_delete_indices = [], [], [], []
     for bi, block in enumerate(blocks):
         cat = classify_block(block)
         if cat == "GPT":
             gpt_indices.append(bi)
         elif cat == "TRANSLATE":
             translate_indices.append(bi)
+        elif cat == "AUTO_DELETE":
+            auto_delete_indices.append(bi)
         else:
             auto_keep_indices.append(bi)
-    print(f"    分类: {len(auto_keep_indices)} 尺寸, {len(translate_indices)} 标注, {len(gpt_indices)} 大块")
+    print(f"    分类: {len(auto_keep_indices)} 尺寸, {len(translate_indices)} 标注, {len(gpt_indices)} 大块, {len(auto_delete_indices)} 强制删除")
 
     # ── block 文本 ──
     block_texts = [block_to_spatial(block) for block in blocks]
@@ -996,6 +1010,8 @@ def process_page(pdf_path, output_path, page_num, output_dir, stem):
         decisions[bi] = "KEEP"
     for bi in translate_indices:
         decisions[bi] = "KEEP"
+    for bi in auto_delete_indices:
+        decisions[bi] = "DELETE"
     for gi, bi in enumerate(gpt_indices):
         decisions[bi] = gpt_decisions.get(gi, "DELETE")
 

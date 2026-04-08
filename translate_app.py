@@ -847,21 +847,29 @@ with tab_pdf:
 
         # 打包结果
         if len(result_files) == 1:
-            # 单文件直接下载 PDF
             fname, data = next(iter(result_files.items()))
             st.session_state.pdf_result = data
             st.session_state.pdf_filename = fname
         else:
-            # 多文件打包 ZIP
+            # 多文件打包 ZIP（按原始顺序排列）
             import io as _io
             zip_buf = _io.BytesIO()
             import zipfile as _zf2
+            # 按 filtered_paths 的原始顺序写入
+            ordered_names = [os.path.basename(p) for p in filtered_paths]
             with _zf2.ZipFile(zip_buf, 'w', _zf2.ZIP_DEFLATED) as zf:
-                for fname, data in result_files.items():
-                    zf.writestr(fname, data)
+                for fname in ordered_names:
+                    if fname in result_files:
+                        zf.writestr(fname, result_files[fname])
             zip_buf.seek(0)
             st.session_state.pdf_result = zip_buf.getvalue()
-            st.session_state.pdf_filename = "redacted_drawings.zip"
+            # 使用原始上传的 ZIP 文件名，或首个文件名
+            orig_zip_name = None
+            for uf in uploaded_files:
+                if uf.name.lower().endswith(".zip"):
+                    orig_zip_name = uf.name
+                    break
+            st.session_state.pdf_filename = orig_zip_name or f"{Path(ordered_names[0]).stem}_batch.zip"
 
         st.session_state.pdf_product = f"{len(result_files)} 个文件"
         st.session_state.pdf_processing = False
