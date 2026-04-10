@@ -1,0 +1,40 @@
+name: sensitive_data
+description: 所有品牌/公司名/强制删除关键词的正则规则
+# 用 (?i) 前缀表示 IGNORECASE;无前缀则大小写敏感。
+
+# OCR 噪音过滤阶段使用:完整匹配的品牌名 item 在聚类前剔除
+brand_patterns:
+  - '(?i)^GE\s+APPLIANCES$'
+  - '(?i)^GEA$'
+  - '(?i)^GENERAL\s+ELECTRIC$'
+  - '(?i)^ROPER\s+CORP\.?$'
+  - '(?i)^HAIER$'
+
+# 小 block 强制删除:只要文本包含任一关键词就直接 DELETE
+auto_delete_patterns:
+  - '(?i)UNCONTROLLED'
+  - '(?i)DO\s*NOT\s*SCALE'
+
+# 翻译前后替换为 [品牌] 占位符
+sensitive_replacements:
+  - pattern: '(?i)\bGE\s+APPLIANCES\b'
+    replacement: '[品牌]'
+  - pattern: '(?i)\bGENERAL\s+ELECTRIC\b'
+    replacement: '[品牌]'
+  - pattern: '(?i)\bGEA\b'
+    replacement: '[品牌]'
+  - pattern: '(?i)(?<!\w)GE(?!\w)'
+    replacement: '[品牌]'
+  - pattern: '(?i)\bROPER\s+CORP\.?\b'
+    replacement: '[品牌]'
+  - pattern: '(?i)\bHAIER\b'
+    replacement: '[品牌]'
+
+# 脱敏阶段的 inline 精确遮盖(比 sensitive_replacements 少一个 IGNORECASE 标志)
+brand_inline_patterns:
+  - '(?i)\bGE\s+APPLIANCES\b'
+  - '(?i)\bGENERAL\s+ELECTRIC\b'
+  - '(?i)\bGEA\b'
+  - '(?<!\w)GE(?!\w)'
+  - '(?i)\bROPER\s+CORP\.?\b'
+  - '(?i)\bHAIER\b'

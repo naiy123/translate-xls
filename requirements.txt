@@ -1,7 +1,22 @@
-streamlit
-openpyxl
-xlrd
-openai
-pymupdf
-requests
-pillow
+# Python 依赖清单
+# 本地安装: pip install -r requirements.txt
+# Streamlit Cloud 部署时会自动读取此文件
+
+# ── 图纸流水线(redact + translate)──
+openai>=1.0
+PyMuPDF>=1.26        # import fitz
+requests>=2.32
+python-dotenv>=1.0
+httpx[socks]>=0.27   # SOCKS 代理环境下 openai client 需要
+pillow>=10.0         # PIL.Image 用于白色检测
+numpy>=1.26          # find_white_space 里做像素比例
+
+# ── Excel 翻译流水线 ──
+openpyxl>=3.1
+xlrd==2.0.*          # 只读 .xls(2.0 移除了 xlsx 支持,这里明确锁定)
+
+# ── 配置 / 提示词 ──
+PyYAML>=6.0          # gjr/prompts/*.yaml 加载
+
+# ── Web UI ──
+streamlit>=1.40

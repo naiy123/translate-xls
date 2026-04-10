@@ -1,0 +1,39 @@
+name: xlsx_glossary
+description: 从 Excel 表格内容中提取专业术语表,用于后续翻译一致性
+# 注意:变量使用 $var 语法(string.Template),不是 {var}。
+# 因为老的 prompt 里有 "R{行}C{列}" 这种花括号字面量,避免和 .format 冲突。
+
+temperature: 0.1
+
+system: "你是工业制造领域的专业翻译专家，精通中文和${lang_name}。"
+
+user: |-
+  以下是一份工业制造作业指导书的表格内容。
+  请提取所有专业术语和重复出现的关键词（约20-40个），
+  给出中文 → ${lang_name} 的对照翻译。
+
+  要求：
+  - 只提取专业术语和关键词，不要翻译整个句子
+  - 术语翻译要准确、专业${fallback_glossary_rule}
+  - 对于在${lang_name}中容易混淆、有多种译法、或需要特别注意的术语，
+    请在后面用括号标注翻译难点和选择该译法的理由
+
+  输出格式（每行一个术语）：
+  中文 | ${lang_name}翻译 | 注意事项（如有）
+
+  示例：
+  毛刺 | Burr | (钣金行业专用，不要译为 flash/fin)
+  首检 | First Article Inspection | (FAI，行业标准缩写)
+
+  ---表格内容---
+  ${all_text}
+
+# fallback 规则(只对 th/my 生效,其它语言留空)
+fallback_glossary_rule_th_my: |-
+
+  - 对于难以直接翻译为${lang_name}的术语，请按优先级尝试：
+    1. 分词后逐部分翻译为${lang_name}（如"底钢侧板"→拆分为"底部"+"钢"+"侧板"分别翻译）
+    2. 无法用${lang_name}表达的部分用英文
+    3. 中国人名/地名用${lang_name}音译或拼音
+    4. 只有完全无法处理时才保留中文
+    在注意事项中标注你选择了哪种 fallback 方式及原因

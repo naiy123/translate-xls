@@ -1,40 +1,54 @@
-# Environment variables
+# ── 敏感配置 ─────────────────────────────────
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
+~/.translate_xls_key
 
-# Python
+# ── macOS / 编辑器 ───────────────────────────
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+*.swn
+*~
+
+# ── Python ──────────────────────────────────
 __pycache__/
+**/__pycache__/
 *.py[cod]
 *$py.class
 *.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 *.egg-info/
-dist/
 build/
-.eggs/
-venv/
+dist/
+
+# ── 虚拟环境(本地 conda 由 miniconda 管理,不入 repo)
 .venv/
+venv/
+env/
+ENV/
 
-# IDE
-.vscode/
-.idea/
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Output
+# ── 运行产物 ─────────────────────────────────
 output/
+tmp_extract/
+tmp/
+/tmp/*
+*.log
 
-# Model files
-*.onnx
-*.pdmodel
-*.pdiparams
-*.pt
-*.bin
-24079f34b20c56f7dedbb7507f4ed0c2_1.pdf
+# ── 测试/样本数据(大文件 + 真实零件数据)────
+sample/
+# 根目录散落的测试 zip/xls/pdf(非项目代码)
+/*.zip
+/*.xls
+/*.xlsx
+# 根目录的测试 PDF(中文命名的样本)
+/工艺指导*.pdf
+/图纸*.pdf
+/问题*.pdf
 
-# GJR test files
-gjr/output/
-gjr/*.pdf
-gjr/*.xls
+# ── Claude Code / agent 缓存 ─────────────────
+.claude/
