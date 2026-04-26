@@ -22,7 +22,14 @@ import fitz
 
 from gjr.api_log import log_api_call, set_log_context
 from gjr.classify import DWG_PAT, block_to_spatial, classify_block
-from gjr.cluster import block_bbox_raw, cluster_blocks, snap_bbox
+from gjr.cluster import (
+    absorb_nested_blocks,
+    block_bbox_raw,
+    cluster_blocks,
+    merge_by_shared_edges,
+    snap_bbox,
+)
+from gjr.geometry import PageGeometry
 from gjr.config import load_sensitive
 from gjr.gpt_redact import ask_gpt, parse_gpt_result
 from gjr.gpt_translate import batch_translate_labels, translate_block
@@ -74,58 +81,50 @@ def process_page(pdf_path, output_path, page_num, output_dir, stem, debug_previe
     # ── Step 2: 预处理 ──
     print(f"  [{page_label}] Step 2: 预处理")
 
-    # 提取矢量线 + 检测内框(多页 PDF 不能复用 cluster.detect_frame,它写死了第 0 页)
-    doc = fitz.open(str(pdf_path))
-    page = doc[page_num]
-    pw, ph = page.rect.width, page.rect.height
-    h_lines, v_lines = [], []
-    for d in page.get_drawings():
-        for item in d["items"]:
-            if item[0] == "l":
-                p1, p2 = item[1], item[2]
-                x1, y1, x2, y2 = p1.x, p1.y, p2.x, p2.y
-                if abs(y2-y1) < 1 and abs(x2-x1) > 10:
-                    h_lines.append((round((y1+y2)/2, 1), min(x1, x2), max(x1, x2)))
-                elif abs(x2-x1) < 1 and abs(y2-y1) > 10:
-                    v_lines.append((round((x1+x2)/2, 1), min(y1, y2), max(y1, y2)))
-    doc.close()
-
-    frame_h = [h for h in h_lines if h[2] - h[1] > pw * 0.5]
-    frame_v = [v for v in v_lines if v[2] - v[1] > ph * 0.5]
-    inner_h = sorted([y for y, x1, x2 in frame_h if y > 10 and y < ph - 10])
-    inner_v = sorted([x for x, y1, y2 in frame_v if x > 10 and x < pw - 10])
-    if len(inner_h) >= 2 and len(inner_v) >= 2:
-        ix1, iy1, ix2, iy2 = inner_v[0], inner_h[0], inner_v[-1], inner_h[-1]
-    else:
-        ix1, iy1, ix2, iy2 = 72, 36, pw - 72, ph - 36
+    geom = PageGeometry.from_pdf_page(pdf_path, page_num)
+    pw, ph = geom.pw, geom.ph
+    ix1, iy1, ix2, iy2 = geom.inner
+    h_lines, v_lines = geom.h_lines, geom.v_lines
+    frame_h, frame_v = geom.frame_h, geom.frame_v
+    title_rect = geom.title_rect
     print(f"    内框: ({ix1:.0f},{iy1:.0f})-({ix2:.0f},{iy2:.0f})")
 
     all_items = parse_items(ocr_result)
-    items = [it for it in all_items
-             if it["left"] >= ix1 - 5 and it["right"] <= ix2 + 5
-             and it["top"] >= iy1 - 5 and it["bottom"] <= iy2 + 5]
+    items = [it for it in all_items if geom.is_in_inner(it)]
     print(f"    OCR: {len(all_items)} 行, 内框内: {len(items)} 行 (过滤 {len(all_items)-len(items)} 行框外)")
 
-    items = filter_noise(items)
-
+    items = filter_noise(items, title_rect=title_rect)
     if not items:
         print(f"    跳过（过滤后无内容）")
         return None, {}
 
-    blocks = cluster_blocks(items)
+    # 聚类时把矢量框线喂进去:被框线隔开的 items 走原始距离,
+    # 未被分隔的(同表格单元/同连通区)距离打 0.3 折,更容易归一块。
+    blocks = cluster_blocks(items, h_lines=h_lines, v_lines=v_lines)
 
-    snapped_bboxes = []
-    for bi, block in enumerate(blocks):
-        raw = block_bbox_raw(block)
-        snapped = snap_bbox(*raw, h_lines, v_lines)
-        snapped_bboxes.append(snapped)
+    snapped_bboxes = [snap_bbox(*block_bbox_raw(b), h_lines, v_lines) for b in blocks]
 
-    print(f"    {len(items)} 行 → {len(blocks)} 个 block")
+    # snap 后两步收敛:
+    #  ① absorb_nested_blocks - 消除"snap 互嵌":若 A 完全包含 B,把 B 吞入 A
+    #  ② merge_by_shared_edges  - 标题栏内共享 snap 边的 block 合并
+    n_raw = len(blocks)
+    blocks, snapped_bboxes = absorb_nested_blocks(blocks, snapped_bboxes)
+    n_after_absorb = len(blocks)
+    blocks, snapped_bboxes = merge_by_shared_edges(blocks, snapped_bboxes, pw, ph)
+    n_after_merge = len(blocks)
+
+    parts = [f"{len(items)} 行 → {n_raw} 块"]
+    if n_after_absorb < n_raw:
+        parts.append(f"嵌套吞并 {n_raw - n_after_absorb}")
+    if n_after_merge < n_after_absorb:
+        parts.append(f"边贴合并 {n_after_absorb - n_after_merge}")
+    parts.append(f"最终 {n_after_merge} 块")
+    print("    " + " → ".join(parts))
 
     # ── 预分类 ──
     gpt_indices, auto_keep_indices, translate_indices, auto_delete_indices = [], [], [], []
     for bi, block in enumerate(blocks):
-        cat = classify_block(block)
+        cat = classify_block(block, in_title_rect=geom.is_in_title(snapped_bboxes[bi]))
         if cat == "GPT":
             gpt_indices.append(bi)
         elif cat == "TRANSLATE":
@@ -139,7 +138,7 @@ def process_page(pdf_path, output_path, page_num, output_dir, stem, debug_previe
     if debug_preview:
         render_debug_previews(pdf_path, page_num, output_dir, stem,
                               items, blocks, snapped_bboxes,
-                              raw_items=all_items)
+                              raw_items=all_items, title_rect=title_rect)
 
     # ── block 文本 ──
     block_texts = [block_to_spatial(block) for block in blocks]

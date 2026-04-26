@@ -6,6 +6,9 @@ Streamlit Cloud 的 Main file 路径是 translate_app.py(历史原因),
 避免用户手动改 Cloud 设置。
 
 等价于 "Main file path = streamlit_app.py",零侧效应。
+
+本地开发直接用 `streamlit run streamlit_app.py` 即可,
+这个文件只在 Streamlit Cloud 部署时被调用。
 """
 from pathlib import Path
 

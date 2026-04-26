@@ -77,14 +77,29 @@ def parse_items(ocr_result):
 _SHORT_SYM_PAT = re.compile(r'^[A-Za-z0-9↑↓←→]+$')
 
 
-def filter_noise(items):
-    """剔除短符号和纯品牌名 bbox,避免把品牌名 item 撑进聚类块。"""
+def _in_rect(it, rect):
+    if rect is None:
+        return False
+    rx1, ry1, rx2, ry2 = rect
+    return it["left"] >= rx1 and it["top"] >= ry1 and it["right"] <= rx2 and it["bottom"] <= ry2
+
+
+def filter_noise(items, title_rect=None):
+    """剔除短符号和纯品牌名 bbox。
+
+    short 符号过滤是为了清掉图纸绘图区的区位标识(↑/↓/A/D/1/2..),
+    但标题栏里 FAN/CAD 列 P001/P002 等 3 字短词也会误伤。
+    传入 title_rect 后,落在该矩形内的短 item 不再剔除,
+    避免后续 DBSCAN 因缺失"垫脚石 item"把标题栏切碎。
+    品牌名过滤对全页生效(品牌哪儿冒头都得删)。
+    """
     brand_patterns = load_sensitive()["brand_patterns"]
     result = []
     for it in items:
         text = it["text"].strip()
-        if len(text) <= 3 and _SHORT_SYM_PAT.match(text):
-            continue
+        if not _in_rect(it, title_rect):
+            if len(text) <= 3 and _SHORT_SYM_PAT.match(text):
+                continue
         if any(p.match(text) for p in brand_patterns):
             continue
         result.append(it)

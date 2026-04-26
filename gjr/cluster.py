@@ -17,12 +17,53 @@ def _bbox_gap(a, b):
     return max(dx, dy)
 
 
-def cluster_blocks(items, eps=DBSCAN_EPS):
+def _line_separates(a, b, h_lines, v_lines):
+    """判定两个 bbox 的中心连线是否被矢量框线穿过。
+
+    用线段 vs 框线的交点测试:对每条垂直线看连线是否跨越其 x,
+    并检查交点的 y 是否落在线段范围内;水平线同理。
+    命中任一条即认为"中间有框线"→ 属于不同表格单元/不同区域。
+    """
+    if not h_lines and not v_lines:
+        return False
+    ax = (a["left"] + a["right"]) / 2
+    ay = (a["top"] + a["bottom"]) / 2
+    bx = (b["left"] + b["right"]) / 2
+    by = (b["top"] + b["bottom"]) / 2
+    if v_lines and ax != bx:
+        dx = bx - ax
+        lo_x, hi_x = (ax, bx) if ax < bx else (bx, ax)
+        for vx, y1, y2 in v_lines:
+            if vx < lo_x or vx > hi_x:
+                continue
+            t = (vx - ax) / dx
+            iy = ay + t * (by - ay)
+            if y1 <= iy <= y2:
+                return True
+    if h_lines and ay != by:
+        dy = by - ay
+        lo_y, hi_y = (ay, by) if ay < by else (by, ay)
+        for hy, x1, x2 in h_lines:
+            if hy < lo_y or hy > hi_y:
+                continue
+            t = (hy - ay) / dy
+            ix = ax + t * (bx - ax)
+            if x1 <= ix <= x2:
+                return True
+    return False
+
+
+def cluster_blocks(items, eps=DBSCAN_EPS, h_lines=None, v_lines=None,
+                   same_cell_factor=0.3):
     """
     DBSCAN 二维空间聚类(手写实现,零依赖)。
 
     距离度量:两个 bbox 边缘间的切比雪夫距离。
     解决旧算法的桥接问题——不同区域即使 Y 重叠,X 间距大也不会连通。
+
+    若传入 h_lines/v_lines,对"中心连线未被任何框线穿过"的 item 对
+    把距离打一个折扣(same_cell_factor,默认 0.3),让同一连通区域内
+    偏远的 items 更容易进同一块;被框线隔开的 items 仍按原距离判断。
     """
     if not items:
         return []
@@ -33,6 +74,16 @@ def cluster_blocks(items, eps=DBSCAN_EPS):
     visited = [False] * n
     labels = [-1] * n
     cluster_id = 0
+
+    def _gap(a, b):
+        base = _bbox_gap(a, b)
+        if base == 0:
+            return 0
+        if h_lines is None and v_lines is None:
+            return base
+        if _line_separates(a, b, h_lines or [], v_lines or []):
+            return base
+        return base * same_cell_factor
 
     for i in range(n):
         if visited[i]:
@@ -45,7 +96,7 @@ def cluster_blocks(items, eps=DBSCAN_EPS):
             for j in range(n):
                 if visited[j]:
                     continue
-                if _bbox_gap(items[p], items[j]) <= eps:
+                if _gap(items[p], items[j]) <= eps:
                     visited[j] = True
                     labels[j] = cluster_id
                     queue.append(j)
@@ -57,6 +108,144 @@ def cluster_blocks(items, eps=DBSCAN_EPS):
 
     blocks = sorted(clusters.values(), key=lambda b: min(it["top"] for it in b))
     return blocks
+
+
+def absorb_nested_blocks(blocks, snapped_bboxes, slack=2.0):
+    """若 cluster A 的 snap bbox 完全包含 cluster B(slack 容差),
+    把 B 的 items 并入 A、移除 B,保证聚类输出"互不相交分区"语义。
+
+    病灶:snap_bbox 是逐块独立调用的,每块各自往最近矢量线扩张,
+    互不感知。结果出现 #6 完全嵌套在 #8 内、redact 双涂、annot 双写。
+    这一步在 snap 后扫一遍嵌套关系,把内套块吞入外包块。
+    """
+    n = len(blocks)
+    if n <= 1:
+        return blocks, snapped_bboxes
+
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def contains(big, small):
+        return (big[0] - slack <= small[0] and small[2] <= big[2] + slack
+                and big[1] - slack <= small[1] and small[3] <= big[3] + slack)
+
+    # 按面积降序遍历:先处理大的,小的去找包含它的最小父亲
+    def _area(bi):
+        b = snapped_bboxes[bi]
+        return (b[2] - b[0]) * (b[3] - b[1])
+
+    order = sorted(range(n), key=lambda i: -_area(i))
+    for i_pos, i in enumerate(order):
+        # 在比 i 大的 block 里找包含 i 的(取最小的那个 = 直接父亲)
+        best_parent = None
+        best_area = float("inf")
+        for j in order[:i_pos]:
+            if contains(snapped_bboxes[j], snapped_bboxes[i]):
+                a = _area(j)
+                if a < best_area:
+                    best_area = a
+                    best_parent = j
+        if best_parent is not None:
+            parent[find(i)] = find(best_parent)
+
+    groups = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(i)
+
+    new_blocks, new_bboxes = [], []
+    for root, members in groups.items():
+        merged_items = []
+        for m in members:
+            merged_items.extend(blocks[m])
+        # snap bbox 取根(外包块)的,保留扩张结果
+        new_blocks.append(merged_items)
+        new_bboxes.append(snapped_bboxes[root])
+
+    order2 = sorted(range(len(new_blocks)),
+                    key=lambda k: (new_bboxes[k][1], new_bboxes[k][0]))
+    new_blocks = [new_blocks[k] for k in order2]
+    new_bboxes = [new_bboxes[k] for k in order2]
+    return new_blocks, new_bboxes
+
+
+def merge_by_shared_edges(blocks, snapped_bboxes, pw, ph,
+                          region=None, tol=1.5, min_overlap=4.0):
+    """Snap 后共享边合并:两个 snapped_bbox 若在同一条吸附线上贴边,
+    且相邻边投影有足够重叠,视为同一表格连通区域,合并为一个 block。
+
+    只在 region 矩形内触发(默认右下 45% 宽 × 30% 高,覆盖标题栏),
+    避免绘图区边缘两个 bbox 偶然 snap 到同一条外框而误粘。
+    """
+    n = len(blocks)
+    if n <= 1:
+        return blocks, snapped_bboxes
+
+    if region is None:
+        rx1 = pw * 0.55
+        ry1 = ph * 0.70
+        rx2 = pw
+        ry2 = ph
+    else:
+        rx1, ry1, rx2, ry2 = region
+
+    def _center_in_region(bbox):
+        cx = (bbox[0] + bbox[2]) / 2
+        cy = (bbox[1] + bbox[3]) / 2
+        return rx1 <= cx <= rx2 and ry1 <= cy <= ry2
+
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    eligible = [i for i in range(n) if _center_in_region(snapped_bboxes[i])]
+    for idx_a, i in enumerate(eligible):
+        ax1, ay1, ax2, ay2 = snapped_bboxes[i]
+        for j in eligible[idx_a + 1:]:
+            bx1, by1, bx2, by2 = snapped_bboxes[j]
+            shared_v = abs(ax2 - bx1) < tol or abs(bx2 - ax1) < tol
+            y_over = min(ay2, by2) - max(ay1, by1)
+            if shared_v and y_over > min_overlap:
+                union(i, j)
+                continue
+            shared_h = abs(ay2 - by1) < tol or abs(by2 - ay1) < tol
+            x_over = min(ax2, bx2) - max(ax1, bx1)
+            if shared_h and x_over > min_overlap:
+                union(i, j)
+
+    groups = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(i)
+
+    new_blocks, new_bboxes = [], []
+    for members in groups.values():
+        merged_items = []
+        for m in members:
+            merged_items.extend(blocks[m])
+        x1 = min(snapped_bboxes[m][0] for m in members)
+        y1 = min(snapped_bboxes[m][1] for m in members)
+        x2 = max(snapped_bboxes[m][2] for m in members)
+        y2 = max(snapped_bboxes[m][3] for m in members)
+        new_blocks.append(merged_items)
+        new_bboxes.append((x1, y1, x2, y2))
+
+    order = sorted(range(len(new_blocks)), key=lambda k: (new_bboxes[k][1], new_bboxes[k][0]))
+    new_blocks = [new_blocks[k] for k in order]
+    new_bboxes = [new_bboxes[k] for k in order]
+    return new_blocks, new_bboxes
 
 
 def extract_lines(pdf_path):

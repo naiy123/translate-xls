@@ -11,7 +11,7 @@ from gjr.config import CLASS_COLORS, PREVIEW_PALETTE
 
 def render_debug_previews(pdf_path, page_num, output_dir, stem,
                           items, blocks, snapped_bboxes, dpi=200,
-                          raw_items=None):
+                          raw_items=None, title_rect=None):
     """
     输出三张 debug PNG:原始 bbox / 聚类 / 分类。不修改原 PDF。
 
@@ -22,10 +22,22 @@ def render_debug_previews(pdf_path, page_num, output_dir, stem,
       raw_items   — 百度 OCR 原始 items(过滤前)。传入后 bbox.png 显示所有原始行,
                     否则 fallback 到 items(过滤后)。
                     推荐始终传 raw_items,便于观察内框过滤是否误伤
+      title_rect  — 右下标题栏区。传入后 class 图按位置感知分类(中心在区内的
+                    小块升级为 GPT),与主流水线决策一致
     """
     page_label = f"p{page_num+1}"
     mat = fitz.Matrix(dpi / 72, dpi / 72)
-    block_cats = [classify_block(b) for b in blocks]
+
+    def _in_title(bbox):
+        if title_rect is None:
+            return False
+        cx = (bbox[0] + bbox[2]) / 2
+        cy = (bbox[1] + bbox[3]) / 2
+        return (title_rect[0] <= cx <= title_rect[2]
+                and title_rect[1] <= cy <= title_rect[3])
+
+    block_cats = [classify_block(b, in_title_rect=_in_title(snapped_bboxes[bi]))
+                  for bi, b in enumerate(blocks)]
     # bbox 图显示原始 OCR(过滤前),能看到哪些被内框/噪音过滤器剔除了
     bbox_items = raw_items if raw_items is not None else items
 
